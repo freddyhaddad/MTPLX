@@ -4372,6 +4372,7 @@ class _BatchedARGenerationService:
                 draft_head_identity=getattr(self.state, "draft_head_identity", None),
                 policy_fingerprint=job.session_policy_fingerprint,
                 abort_check=job.cancel_requested,
+                chunk_started_s=started,  # the restore reads its `started` only when this is given
             )
         except Exception as exc:  # noqa: BLE001
             job.request_observability["ar_batch_near_prefix_error"] = f"{type(exc).__name__}: {exc}"
