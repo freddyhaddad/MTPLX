@@ -213,3 +213,48 @@ def test_exact_miss_falls_back_to_the_near_prefix_boundary_restore(monkeypatch):
     monkeypatch.setattr(gen, "_restore_near_prefix_prompt_state", lambda *a, **k: None)
     job2 = _job(prompt, bank=_MissBank())
     assert svc._prepare_session_bank_restore(job2) is False and job2.cache_miss_reason == "ssd_prefix_miss"
+
+
+def test_longer_exact_entry_falls_through_to_the_boundary_restore(monkeypatch):
+    """The exact entry is the previous turn's prompt + generation: longer than the prompt, not
+    insertable. The lane must use the boundary restore (as the solo lane does), not refuse."""
+    import mtplx.generation as gen
+
+    class _LongBank:
+        last_ram_miss_reason = None
+        last_miss_reason = None
+        def __init__(self): self.calls = []
+        def restore(self, runtime, prompt_ids, *, mode, **kw):
+            self.calls.append(mode)
+            return SimpleNamespace(cache=[_Entry()], entry=SimpleNamespace(prefix_len=len(prompt_ids) + 160, token_ids=list(prompt_ids) + [7] * 160), restore_mode="clone")
+        def longest_prefix(self, prompt_ids):
+            return SimpleNamespace(prefix_len=len(prompt_ids) + 160)
+
+    monkeypatch.setattr(gen, "_restore_near_prefix_prompt_state", lambda rt, head, **kw: SimpleNamespace(
+        cache_hit=True, trunk_cache=[_Entry()], cached_tokens=len(head), suffix_tokens=0, restore_mode="near_boundary",
+        cache_source="ram", ssd_cache_hit=False, ssd_cached_tokens=0, ssd_restore_s=0.0))
+    rt = _Runtime(); rt.contract = SimpleNamespace(hidden_variant="post_norm", base_hidden_variant="post_norm")
+    svc = _service(rt); bank = _LongBank(); prompt = list(range(700)); job = _job(prompt, bank=bank)
+    assert svc._prepare_session_bank_restore(job) is True
+    assert bank.calls == ["clone"], "no reference lease is taken for a non-insertable entry"
+    assert job.cached_tokens == 699 and job.insert_prompt_ids == [prompt[-1]] and job.session_cache_hit
+
+
+def test_longer_live_ref_entry_is_not_leased(monkeypatch):
+    import mtplx.generation as gen
+
+    class _LiveBank:
+        last_ram_miss_reason = "no_snapshot_coverage"
+        last_miss_reason = "ssd_prefix_miss"
+        def __init__(self): self.calls = []
+        def restore(self, runtime, prompt_ids, *, mode, **kw):
+            self.calls.append(mode); return None
+        def longest_prefix(self, prompt_ids):
+            return SimpleNamespace(prefix_len=len(prompt_ids) + 40)
+
+    monkeypatch.setattr(gen, "_restore_near_prefix_prompt_state", lambda rt, head, **kw: None)
+    rt = _Runtime(); rt.contract = SimpleNamespace(hidden_variant="post_norm", base_hidden_variant="post_norm")
+    svc = _service(rt); bank = _LiveBank(); job = _job(list(range(700)), bank=bank)
+    assert svc._prepare_session_bank_restore(job) is False
+    assert bank.calls == ["clone"], "the lease retry is skipped when the entry could not be inserted anyway"
+    assert job.cache_miss_reason == "ar_batch_full_prefix_not_insertable"
