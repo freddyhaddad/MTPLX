@@ -4034,14 +4034,32 @@ class _BatchedARGenerationService:
         self._wait_pending_postcommit(job)
         started = time.perf_counter()
         try:
+            restore_mode = _session_bank_restore_mode(job.session_restore_mode)
             restored = job.session_bank.restore(
                 self.state.runtime,
                 job.prompt_ids,
-                mode=_session_bank_restore_mode(job.session_restore_mode),
+                mode=restore_mode,
                 session_id=job.session_id,
                 template_hash=job.session_template_hash,
                 policy_fingerprint=job.session_policy_fingerprint,
             )
+            ram_miss = getattr(job.session_bank, "last_ram_miss_reason", None)
+            if restored is None and restore_mode == "clone" and ram_miss == "no_snapshot_coverage":
+                # The entry is a live reference (the solo lane leases the live
+                # cache for coding-agent tool sessions instead of snapshotting
+                # it), so a clone has nothing to copy. Take the lease the same
+                # way the solo lane does; the row's state is banked again when
+                # the batched row finishes. 2026-09-24 opencode receipt: every
+                # same-session follow-up turn on the lane missed this way.
+                restored = job.session_bank.restore(
+                    self.state.runtime,
+                    job.prompt_ids,
+                    mode="reference",
+                    session_id=job.session_id,
+                    template_hash=job.session_template_hash,
+                    policy_fingerprint=job.session_policy_fingerprint,
+                )
+                job.request_observability["ar_batch_restore_retried_as_reference"] = restored is not None
         except Exception as exc:
             job.cache_miss_reason = f"ar_batch_restore_error:{type(exc).__name__}"
             return False
@@ -4059,6 +4077,7 @@ class _BatchedARGenerationService:
                     json.dumps(
                         {
                             "event": "ar_batch_restore_miss_debug",
+                            "ram_miss_reason": getattr(job.session_bank, "last_ram_miss_reason", None),
                             "prompt_len": len(job.prompt_ids),
                             "bank_entries": len(job.session_bank),
                             "miss_reason": job.cache_miss_reason,

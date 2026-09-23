@@ -147,3 +147,42 @@ def test_restore_waits_for_the_sessions_pending_postcommit():
     # no session / no bank: no wait, no error
     job2 = _job(list(range(600)), bank=bank, session_id=None); svc._prepare_session_bank_restore(job2)
     assert session.calls == 1
+
+
+def test_restore_retries_a_live_reference_entry_as_a_lease():
+    class _LeaseBank:
+        def __init__(self):
+            self.calls = []
+            self.last_ram_miss_reason = None
+            self.last_miss_reason = None
+
+        def restore(self, runtime, prompt_ids, *, mode, **kw):
+            self.calls.append(mode)
+            if mode == "clone":
+                self.last_ram_miss_reason = "no_snapshot_coverage"
+                self.last_miss_reason = "ssd_prefix_miss"
+                return None
+            entry = SimpleNamespace(prefix_len=len(prompt_ids) - 5, token_ids=list(prompt_ids[:-5]))
+            return SimpleNamespace(cache=[_Entry()], entry=entry, restore_mode="reference_lease")
+
+    rt = _Runtime(); svc = _service(rt); bank = _LeaseBank()
+    job = _job(list(range(600)), bank=bank)
+    assert svc._prepare_session_bank_restore(job) is True
+    assert bank.calls == ["clone", "reference"]
+    assert job.cached_tokens == 595 and job.insert_cache is not None and job.cache_miss_reason is None
+    assert job.request_observability["ar_batch_restore_retried_as_reference"] is True
+
+
+def test_restore_does_not_retry_other_ram_misses():
+    class _MissBank:
+        def __init__(self):
+            self.calls = []
+            self.last_ram_miss_reason = "policy_mismatch"
+            self.last_miss_reason = "ssd_prefix_miss"
+
+        def restore(self, runtime, prompt_ids, *, mode, **kw):
+            self.calls.append(mode); return None
+
+    rt = _Runtime(); svc = _service(rt); bank = _MissBank()
+    job = _job(list(range(600)), bank=bank)
+    assert svc._prepare_session_bank_restore(job) is False and bank.calls == ["clone"]
