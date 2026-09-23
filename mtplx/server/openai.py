@@ -3858,8 +3858,22 @@ def _make_handover_check(state: Any, *, seed_is_explicit: bool) -> Callable[[], 
         return None
     service = state.ar_batch_service
     scheduler = getattr(state, "model_scheduler", None)
+    min_solo_tokens = _lane_handover_min_solo_tokens()
+    cooldown_s = _lane_handover_cooldown_s()
+    polls = 0
 
     def check() -> bool:
+        # Hysteresis (2026-09-24, 145k-token session receipt: handover -> return ->
+        # handover three times inside one turn, one token apart, each round
+        # cloning a 3.5 GB cache): run at least min_solo_tokens on the solo lane
+        # first, and never hand over within cooldown_s of a return trip.
+        nonlocal polls
+        polls += 1
+        if polls < min_solo_tokens:
+            return False
+        last_resume = float(getattr(state, "_lane_handover_last_resume_s", 0.0) or 0.0)
+        if last_resume and time.perf_counter() - last_resume < cooldown_s:
+            return False
         try:
             if service.has_pending():
                 return True
@@ -3869,6 +3883,20 @@ def _make_handover_check(state: Any, *, seed_is_explicit: bool) -> Callable[[], 
             return False
 
     return check
+
+
+def _lane_handover_min_solo_tokens() -> int:
+    try:
+        return max(1, int(os.environ.get("MTPLX_LANE_HANDOVER_MIN_SOLO_TOKENS", "16")))
+    except ValueError:
+        return 16
+
+
+def _lane_handover_cooldown_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get("MTPLX_LANE_HANDOVER_COOLDOWN_S", "5")))
+    except ValueError:
+        return 5.0
 
 
 def _submit_lane_continuation(
@@ -4026,6 +4054,10 @@ def _finish_lane_handover(
         resume_prompt = [int(token) for token in prompt_ids] + so_far
         _log_json_event("lane_handover_resume", request_id=job.request_id, session_id=job.session_id,
                         resume_prompt_tokens=len(resume_prompt), batched_tokens=len(batched_tokens), remaining_max_tokens=remaining)
+        try:
+            state._lane_handover_last_resume_s = time.perf_counter()
+        except Exception:  # noqa: BLE001
+            pass
         result = _submit_foreground_model_work(
             state, lambda: _run_generation(state, resume_prompt, **resume_kwargs), batch_key="chat.stream"
         ).result()

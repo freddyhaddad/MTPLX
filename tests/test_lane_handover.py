@@ -61,6 +61,7 @@ def _out(tokens, cache=("cache",)):
 
 def test_handover_check_gates(monkeypatch):
     monkeypatch.delenv("MTPLX_LANE_HANDOVER", raising=False)
+    monkeypatch.setenv("MTPLX_LANE_HANDOVER_MIN_SOLO_TOKENS", "1")  # hysteresis is covered separately
     assert srv._make_handover_check(_state(_Service()), seed_is_explicit=False) is None
     monkeypatch.setenv("MTPLX_LANE_HANDOVER", "1")
     assert srv._make_handover_check(_state(_Service()), seed_is_explicit=True) is None, "seeded streams never hand over"
@@ -237,3 +238,14 @@ def test_submit_lane_continuation_banks_the_handover_state_for_the_return(monkey
     out2 = _out([30, 31, 32]); out2.final_state.final_committed_mtp_cache = None
     srv._submit_lane_continuation(st, [1, 2, 3], out2, **common)
     assert service.jobs[-1].return_to_solo is False
+
+
+# ---------------------------------------------------------------- hysteresis + interleave
+def test_handover_check_hysteresis(monkeypatch):
+    monkeypatch.setenv("MTPLX_LANE_HANDOVER", "1"); monkeypatch.setenv("MTPLX_LANE_HANDOVER_MIN_SOLO_TOKENS", "3"); monkeypatch.setenv("MTPLX_LANE_HANDOVER_COOLDOWN_S", "100")
+    st = _state(_Service(pending=True)); check = srv._make_handover_check(st, seed_is_explicit=False)
+    assert [check(), check(), check()] == [False, False, True], "at least min_solo_tokens polls before a handover"
+    st2 = _state(_Service(pending=True)); st2._lane_handover_last_resume_s = __import__("time").perf_counter()
+    check2 = srv._make_handover_check(st2, seed_is_explicit=False)
+    assert [check2() for _ in range(5)] == [False] * 5, "no handover within the cooldown after a return trip"
+
