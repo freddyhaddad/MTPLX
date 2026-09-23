@@ -258,3 +258,21 @@ def test_longer_live_ref_entry_is_not_leased(monkeypatch):
     assert svc._prepare_session_bank_restore(job) is False
     assert bank.calls == ["clone"], "the lease retry is skipped when the entry could not be inserted anyway"
     assert job.cache_miss_reason == "ar_batch_full_prefix_not_insertable"
+
+
+def test_interleaved_generator_takes_extra_decode_steps_only_while_prefilling(monkeypatch):
+    class _GenBatch:
+        def __init__(self, n): self.n = n; self.calls = 0
+        def __len__(self): return self.n
+        def next(self): self.calls += 1; return [("tok", self.calls)]
+    class _Base:
+        def __init__(self): self._generation_batch = _GenBatch(2); self._currently_processing = ["p"]; self._unprocessed_sequences = []; self._gen_tokens_counter = 0; self._steps_counter = 0; self.base_calls = 0
+        def _next(self): self.base_calls += 1; return (["prompt"], [("tok", "base")])
+    cls = srv._interleaved_batch_generator_class(_Base)
+    monkeypatch.setenv("MTPLX_AR_BATCH_DECODE_STEPS_PER_CHUNK", "4")
+    g = cls(); p, r = g._next()
+    assert p == ["prompt"] and r == [("tok", 1), ("tok", 2), ("tok", 3), ("tok", "base")] and g._steps_counter == 3
+    g2 = cls(); g2._currently_processing = []; g2._unprocessed_sequences = []
+    assert g2._next() == (["prompt"], [("tok", "base")]), "no prefill in progress: stock behaviour"
+    monkeypatch.setenv("MTPLX_AR_BATCH_DECODE_STEPS_PER_CHUNK", "1")
+    g3 = cls(); assert g3._next() == (["prompt"], [("tok", "base")])
