@@ -4136,6 +4136,47 @@ _STABLE_PREFIX_BANK_MIN_TOKENS = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFI
 _STABLE_PREFIX_PREFILL_CHUNK = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_CHUNK", "2048"))
 
 
+def _ar_batch_decode_steps_per_chunk() -> int:
+    """Decode steps the batched lane takes per prefill chunk of an incoming request.
+    mlx-lm's BatchGenerator alternates ONE decode step with ONE prefill chunk, so
+    while a 100k prompt prefills the active streams get a token every ~3.5 s
+    (2026-09-24 receipt: a 145k-token session stalled 110 s behind a 47k
+    session's prefill). N > 1 trades prefill time (~N x 30 ms per chunk) for
+    decode continuity. Default 1 = stock behaviour."""
+    try:
+        return max(1, int(os.environ.get("MTPLX_AR_BATCH_DECODE_STEPS_PER_CHUNK", "1")))
+    except ValueError:
+        return 1
+
+
+def _interleaved_batch_generator_class(base: type) -> type:
+    """Subclass mlx-lm's BatchGenerator (passed in: this module must not import
+    mlx at import time) so each step takes extra decode steps for the active
+    rows before a prefill chunk (see _ar_batch_decode_steps_per_chunk)."""
+
+    class _InterleavedBatchGenerator(base):
+        def _next(self):
+            extra = _ar_batch_decode_steps_per_chunk() - 1
+            gen_batch = getattr(self, "_generation_batch", None)
+            prefilling = bool(getattr(self, "_currently_processing", None)) or bool(
+                getattr(self, "_unprocessed_sequences", None)
+            )
+            extra_responses = []
+            if extra > 0 and prefilling and gen_batch is not None and len(gen_batch) > 0:
+                for _ in range(extra):
+                    if len(gen_batch) == 0:
+                        break
+                    extra_responses.extend(gen_batch.next())
+                    self._gen_tokens_counter += 1
+                    self._steps_counter += 1
+            prompt_responses, generation_responses = super()._next()
+            if extra_responses:
+                generation_responses = [*extra_responses, *generation_responses]
+            return prompt_responses, generation_responses
+
+    return _InterleavedBatchGenerator
+
+
 class _BatchedARGenerationService:
     """Live AR continuous-batching pump owned by ``ModelWorkScheduler``.
 
@@ -5101,7 +5142,7 @@ class _BatchedARGenerationService:
             or getattr(self.state, "context_window", 0)
             or 1
         )
-        generator = BatchGenerator(
+        generator = _interleaved_batch_generator_class(BatchGenerator)(
             self.state.runtime.model,
             max_tokens=max(1, generator_max_tokens),
             stop_tokens=self._stop_sequences(),
