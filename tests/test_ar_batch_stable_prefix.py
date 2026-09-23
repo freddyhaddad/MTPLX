@@ -186,3 +186,30 @@ def test_restore_does_not_retry_other_ram_misses():
     rt = _Runtime(); svc = _service(rt); bank = _MissBank()
     job = _job(list(range(600)), bank=bank)
     assert svc._prepare_session_bank_restore(job) is False and bank.calls == ["clone"]
+
+
+def test_exact_miss_falls_back_to_the_near_prefix_boundary_restore(monkeypatch):
+    import mtplx.generation as gen
+
+    class _MissBank:
+        last_ram_miss_reason = "prefix_divergence_at_token"
+        last_miss_reason = "ssd_prefix_miss"
+        def restore(self, *a, **k): return None
+
+    seen = {}
+    def fake_near(rt, head, **kw):
+        seen["head"] = list(head); seen["kw"] = kw
+        return SimpleNamespace(cache_hit=True, trunk_cache=[_Entry()], cached_tokens=len(head) - 40, suffix_tokens=40,
+                               restore_mode="near_boundary", cache_source="ram", ssd_cache_hit=False, ssd_cached_tokens=0, ssd_restore_s=0.0)
+    monkeypatch.setattr(gen, "_restore_near_prefix_prompt_state", fake_near)
+    rt = _Runtime(); rt.contract = SimpleNamespace(hidden_variant="post_norm", base_hidden_variant="post_norm")
+    svc = _service(rt); prompt = list(range(700)); job = _job(prompt, bank=_MissBank())
+    assert svc._prepare_session_bank_restore(job) is True
+    assert seen["head"] == prompt[:-1] and seen["kw"]["template_hash"] == "t" and seen["kw"]["policy_fingerprint"] == "p"
+    assert job.insert_all_tokens == prompt[:-1] and job.insert_prompt_ids == [prompt[-1]], "last token is left for the generator"
+    assert job.cached_tokens == 659 and job.session_cache_hit and job.cache_miss_reason is None
+    assert job.effective_restore_mode == "ar_batch_near_prefix:near_boundary"
+    # a near-prefix miss leaves the exact miss reason in place
+    monkeypatch.setattr(gen, "_restore_near_prefix_prompt_state", lambda *a, **k: None)
+    job2 = _job(prompt, bank=_MissBank())
+    assert svc._prepare_session_bank_restore(job2) is False and job2.cache_miss_reason == "ssd_prefix_miss"
