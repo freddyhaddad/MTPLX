@@ -3556,6 +3556,18 @@ def _qsa_batched_decode_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+_QSA_BATCHED_DECODE_NOTES: dict = {}
+
+
+def _qsa_batched_decode_note(reason: str) -> None:
+    """Print each decline reason once per process (and count it) so a live A/B can tell
+    whether the batched path engaged; the engaged case prints once too."""
+    n = _QSA_BATCHED_DECODE_NOTES.get(reason, 0) + 1
+    _QSA_BATCHED_DECODE_NOTES[reason] = n
+    if n == 1:
+        print(f"[qwen4_exp] batched QSA decode: {reason}", flush=True)
+
+
 def _qsa_batched_decode(attn, x: mx.array, cache: "BatchQSACache") -> Optional[mx.array]:
     """Batched decode step for B rows, each with its own single-sequence QSACache.
 
@@ -3566,11 +3578,19 @@ def _qsa_batched_decode(attn, x: mx.array, cache: "BatchQSACache") -> Optional[m
     caller falls back to the per-row loop."""
     B, S, _ = x.shape
     idx = attn.indexer
-    if S != 1 or idx is None or vision_rope_state() is not None or attn._verify_glue_rope(1):
+    reason = None
+    if S != 1:
+        reason = "S!=1"
+    elif idx is None:
+        reason = "no_indexer"
+    elif vision_rope_state() is not None:
+        reason = "vision_rope"
+    elif any(getattr(r, "fixed_capacity", False) for r in cache.rows):
+        reason = "fixed_capacity_row"
+    if reason is not None:
+        _qsa_batched_decode_note(reason)
         return None
     rows = cache.rows
-    if any(getattr(r, "fixed_capacity", False) for r in rows):
-        return None
     ratio = idx.ratio
     # ---- projections (already batched)
     fused = getattr(attn, "qkv_fused", None)
@@ -3598,6 +3618,7 @@ def _qsa_batched_decode(attn, x: mx.array, cache: "BatchQSACache") -> Optional[m
         pos = row.offset
         total = pos + 1
         if total // ratio <= idx.block_topk:
+            _qsa_batched_decode_note("dense_row")
             return None  # dense regime for this row: per-row loop handles it
         qi = idx._prepare_queries_eager(iq[i : i + 1], pos)
         row.write_raw(ik[i : i + 1])
@@ -3643,6 +3664,7 @@ def _qsa_batched_decode(attn, x: mx.array, cache: "BatchQSACache") -> Optional[m
     mask = ok[:, None, None, :]  # [B, 1, 1, W]
     out = _verify_sdpa(q_b, k_b, v_b, scale=attn.scale, mask=mask)
     out = out.transpose(0, 2, 1, 3).reshape(B, 1, -1)
+    _qsa_batched_decode_note("engaged")
     return attn.o_proj(out * mx.sigmoid(gate))
 
 
