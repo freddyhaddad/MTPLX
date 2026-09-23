@@ -1,0 +1,98 @@
+{
+ "7k_B1": {
+  "per_stream_tok_s": [
+   79.7
+  ],
+  "wall_s": 8.4,
+  "lanes": [
+   null
+  ],
+  "hashes": [
+   "335d0913"
+  ]
+ },
+ "7k_B2": {
+  "per_stream_tok_s": [
+   31.4,
+   31.4
+  ],
+  "wall_s": 27.2,
+  "lanes": [
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "22bd6eeb",
+   "64d16247"
+  ]
+ },
+ "7k_B4": {
+  "per_stream_tok_s": [
+   9.9,
+   19.8,
+   23.8,
+   22.1
+  ],
+  "wall_s": 29.0,
+  "lanes": [
+   "ar_batch",
+   "ar_batch",
+   "solo_mtp->ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "773db64c",
+   "30076bb3",
+   "80b89710",
+   "2047cf5e"
+  ]
+ },
+ "20k_B1": {
+  "per_stream_tok_s": [
+   78.2
+  ],
+  "wall_s": 22.1,
+  "lanes": [
+   null
+  ],
+  "hashes": [
+   "9a028903"
+  ]
+ },
+ "20k_B2": {
+  "per_stream_tok_s": [
+   29.6,
+   29.6
+  ],
+  "wall_s": 61.1,
+  "lanes": [
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "25774e1c",
+   "8358e461"
+  ]
+ },
+ "20k_B4": {
+  "per_stream_tok_s": [
+   7.4,
+   27.7,
+   5.9,
+   5.9
+  ],
+  "wall_s": 105.1,
+  "lanes": [
+   "ar_batch",
+   "ar_batch",
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "33a24e4d",
+   "873618bc",
+   "706149ec",
+   "1d0ead20"
+  ]
+ }
+}

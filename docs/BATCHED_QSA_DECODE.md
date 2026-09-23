@@ -29,3 +29,22 @@ per-row loop; caches identical up to fp32 rope rounding on the appended key).
 If the batched eager pass wins: B=2 from ~28 toward 35-40 per stream, B=4 from ~21 toward 26-30.
 If it loses, the next step is a batched `qsa_flash_skip` (grid over batch x head, per-row block
 lists and offsets), which is the multi-day kernel work.
+
+## Measured 2026-09-24 (prod daemon, quiet box, flag off vs on, 160 tokens, temperature 0)
+
+| context | streams | off (per-row loop) tok/s per stream | on (batched eager) |
+|---|---|---|---|
+| 7k | 2 | 31.6 / 31.6 | 25.7 / 25.6 |
+| 7k | 4 | 18.3 / 26.3 / 11.7 / 11.7 | 24.0 / 22.1 / 22.1 / 23.0 |
+| 20k | 2 | 29.5 / 29.5 | 5.6 / 6.2 |
+| 20k | 4 | 2.8 / 29.4 / 6.0 / 7.5 | 2.7 / 6.0 / 23.5 / 5.7 |
+
+Solo (B=1) unchanged at 78-80 (never enters this path). Verdict: **not a win as written**. At 7k it
+evens out a 4-stream batch (+30% on the average) but costs 19% at 2 streams; at 20k it is 5x slower
+than the per-row loop, so something in the eager path scales with context that the single-row lane's
+kernels (compiled indexer + `qsa_flash_skip`) do not. Next step before any further tuning: profile
+one batched step at 20k (scoring matmul over nb_max pooled blocks, the per-row `mx.take` gathers from
+the 20k KV, the f32 pooled mirror rebuild after a bank restore) to find the term that grows with T.
+The output text differs from the loop's (different numeric path), as expected. First A/B was a null
+result because the path declined on the verify-glue rope kernel gate (now removed; a once-per-process
+"[qwen4_exp] batched QSA decode: engaged|<reason>" line confirms engagement).

@@ -1,0 +1,98 @@
+{
+ "7k_B1": {
+  "per_stream_tok_s": [
+   79.8
+  ],
+  "wall_s": 8.4,
+  "lanes": [
+   null
+  ],
+  "hashes": [
+   "335d0913"
+  ]
+ },
+ "7k_B2": {
+  "per_stream_tok_s": [
+   31.6,
+   31.6
+  ],
+  "wall_s": 22.4,
+  "lanes": [
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "22bd6eeb",
+   "64d16247"
+  ]
+ },
+ "7k_B4": {
+  "per_stream_tok_s": [
+   18.3,
+   26.3,
+   11.7,
+   11.7
+  ],
+  "wall_s": 38.2,
+  "lanes": [
+   "ar_batch",
+   "ar_batch",
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "c6c07c4b",
+   "178fabf0",
+   "80c3796b",
+   "621672a2"
+  ]
+ },
+ "20k_B1": {
+  "per_stream_tok_s": [
+   78.7
+  ],
+  "wall_s": 22.0,
+  "lanes": [
+   null
+  ],
+  "hashes": [
+   "9a028903"
+  ]
+ },
+ "20k_B2": {
+  "per_stream_tok_s": [
+   29.5,
+   29.5
+  ],
+  "wall_s": 61.1,
+  "lanes": [
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "25774e1c",
+   "8358e461"
+  ]
+ },
+ "20k_B4": {
+  "per_stream_tok_s": [
+   2.8,
+   29.4,
+   6.0,
+   7.5
+  ],
+  "wall_s": 108.4,
+  "lanes": [
+   "ar_batch",
+   "ar_batch",
+   "ar_batch",
+   "ar_batch"
+  ],
+  "hashes": [
+   "09909bae",
+   "873618bc",
+   "706149ec",
+   "e740b746"
+  ]
+ }
+}
