@@ -3822,6 +3822,11 @@ class _BatchedARJob:
         self.token_times.append(time.perf_counter())
 
 
+# Batched lane: bank the stable prefix (prompt minus the transient trailing hint) per turn.
+_STABLE_PREFIX_BANK_MIN_TOKENS = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_MIN_TOKENS", "512"))
+_STABLE_PREFIX_PREFILL_CHUNK = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_CHUNK", "2048"))
+
+
 class _BatchedARGenerationService:
     """Live AR continuous-batching pump owned by ``ModelWorkScheduler``.
 
@@ -3989,9 +3994,36 @@ class _BatchedARGenerationService:
         max_prefix = min(max(0, len(job.prompt_ids) - 1) for job in jobs)
         return min(len(prefix), max_prefix)
 
+    def _wait_pending_postcommit(self, job: _BatchedARJob) -> None:
+        """Mirror the solo lane: a same-session follow-up turn arriving while the
+        previous turn's postcommit is still pending waits for it (bounded,
+        MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S / 8 s) instead of falling through to
+        an SSD miss and a full re-prefill. Live 2026-09-24 receipt on the
+        batched lane: every opencode follow-up turn resolved to
+        pending_postcommit_near_prefix_match and re-prefilled 15-17k tokens."""
+        sessions = getattr(self.state, "sessions", None)
+        peek = getattr(sessions, "peek", None)
+        if not job.session_id or not callable(peek):
+            return
+        try:
+            session = peek(job.session_id)
+        except Exception:  # noqa: BLE001
+            return
+        wait = getattr(session, "wait_for_pending_postcommit", None)
+        if not callable(wait):
+            return
+        try:
+            outcome = wait()
+        except Exception as exc:  # noqa: BLE001
+            job.request_observability["ar_batch_postcommit_wait_error"] = repr(exc)
+            return
+        if isinstance(outcome, dict) and outcome.get("waited"):
+            job.request_observability["ar_batch_postcommit_wait"] = outcome
+
     def _prepare_session_bank_restore(self, job: _BatchedARJob) -> bool:
         if job.session_bank is None or len(job.prompt_ids) < 2:
             return False
+        self._wait_pending_postcommit(job)
         started = time.perf_counter()
         try:
             restored = job.session_bank.restore(
@@ -4189,6 +4221,86 @@ class _BatchedARGenerationService:
         for job in jobs:
             self._prepare_session_bank_restore(job)
         self._prepare_shared_prefix(jobs)
+        for job in jobs:
+            self._prepare_stable_prefix(job)
+
+    @staticmethod
+    def _stable_prefix_len(job: _BatchedARJob) -> int | None:
+        raw = job.request_observability.get("stable_prefix_len")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        if raw < _STABLE_PREFIX_BANK_MIN_TOKENS or raw >= len(job.prompt_ids):
+            return None
+        return int(raw)
+
+    def _prepare_stable_prefix(self, job: _BatchedARJob) -> None:
+        """Bank this turn's STABLE prefix (the prompt without MTPLX's transient
+        trailing hint) as an exact-prefix entry before the batch generator sees
+        the request. The lane used to bank only the full prompt (hint included)
+        at the prompt boundary, so the next same-session turn, whose prompt
+        never contains the previous hint, diverged ~200 tokens before the
+        entry's end and needed a recurrent boundary the lane never captured:
+        full re-prefill every turn (2026-09-24 opencode receipt). The solo lane
+        freezes its committed frontier at stable_prefix_len; this is the batched
+        equivalent: advance the (restored or fresh) cache to the stable edge with
+        the runtime's own forward, snapshot it into the bank, then let the batch
+        generator prefill only the hint. Never fatal; a failure leaves the job
+        exactly as it was."""
+        stable = self._stable_prefix_len(job)
+        bank = getattr(job, "session_bank", None)
+        if stable is None or bank is None or job.cancel_requested():
+            return
+        if any(int(token) >= (1 << 40) for token in job.prompt_ids[:stable]):
+            return  # vision surrogate ids never enter the batched bank path
+        start = len(job.insert_all_tokens) if job.insert_cache is not None else 0
+        if start > stable:
+            return  # the restore already covers the stable edge (plus some hint tokens)
+        if job.insert_cache is not None and job.insert_all_tokens != list(job.prompt_ids[:start]):
+            return  # not a prefix restore we can extend
+        prepare_started = time.perf_counter()
+        try:
+            import mlx.core as mx
+
+            cache = job.insert_cache if job.insert_cache is not None else self.state.runtime.make_cache()
+            if not self._cache_supports_batch_history_merge(cache):
+                return
+            chunk = max(1, int(_STABLE_PREFIX_PREFILL_CHUNK))
+            with attention_phase("prefill"):
+                for lo in range(start, stable, chunk):
+                    hi = min(stable, lo + chunk)
+                    logits = self.state.runtime.forward_ar(
+                        mx.array([list(job.prompt_ids[lo:hi])]),
+                        cache=cache,
+                        return_hidden=False,
+                    )
+                    mx.eval(logits, [entry.state for entry in cache])
+            snapshot = snapshot_cache(cache)
+            mx.eval(snapshot.states, snapshot.meta_states)
+            put_snapshot = getattr(bank, "put_snapshot", None)
+            stored = False
+            if callable(put_snapshot):
+                entry = put_snapshot(
+                    runtime=self.state.runtime,
+                    token_ids=list(job.prompt_ids[:stable]),
+                    cache_snapshot=snapshot,
+                    logits=None,
+                    hidden=None,
+                    session_id=job.session_id,
+                    template_hash=job.session_template_hash,
+                    policy_fingerprint=job.session_policy_fingerprint,
+                    snapshot_epoch=stable,
+                )
+                stored = entry is not None
+        except Exception as exc:  # noqa: BLE001
+            job.request_observability["ar_batch_stable_prefix_error"] = f"{type(exc).__name__}: {exc}"
+            return
+        job.insert_cache = cache
+        job.insert_all_tokens = list(job.prompt_ids[:stable])
+        job.insert_prompt_ids = list(job.prompt_ids[stable:])
+        job.prompt_prepare_s += time.perf_counter() - prepare_started
+        job.request_observability["ar_batch_stable_prefix_tokens"] = stable
+        job.request_observability["ar_batch_stable_prefix_prefilled"] = stable - start
+        job.request_observability["ar_batch_stable_prefix_bank_stored"] = stored
 
     @staticmethod
     def _cache_supports_batch_history_merge(cache: list[Any] | None) -> bool:
