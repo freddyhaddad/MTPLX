@@ -141,3 +141,99 @@ def test_prepare_prompt_inputs_skips_continuations():
     fresh = SimpleNamespace(request_id="a", continuation=False); cont = SimpleNamespace(request_id="b", continuation=True)
     svc._prepare_prompt_inputs([fresh, cont])
     assert seen == [("restore", "a"), ("shared", ["a"]), ("stable", "a")]
+
+
+# ---------------------------------------------------------------- return trip (batch -> solo)
+def _svc_with(active_jobs, pending=()):
+    from mtplx.server.openai import _BatchedARGenerationService
+    import threading
+    svc = _BatchedARGenerationService.__new__(_BatchedARGenerationService)
+    svc._condition = threading.Condition()
+    svc._active = {uid: job for uid, job in active_jobs}
+    svc._pending = list(pending)
+    return svc
+
+
+class _Gen:
+    def __init__(self): self.removed = []
+    def remove(self, uids): self.removed.extend(uids)
+
+
+def _cont_job(tokens, max_tokens=200, return_to_solo=True, continuation=True):
+    job = SimpleNamespace(continuation=continuation, return_to_solo=return_to_solo, future=Future(), tokens=list(tokens),
+                          max_tokens=max_tokens, token_times=[0.5] * len(tokens), created_s=0.0, request_id="r", session_id="s",
+                          cancel_requested=lambda: False)
+    return job
+
+
+def test_return_to_solo_pulls_the_last_continuation_row(monkeypatch):
+    monkeypatch.delenv("MTPLX_LANE_HANDOVER_RETURN_MIN_TOKENS", raising=False)
+    job = _cont_job([4, 5, 6]); svc = _svc_with([(7, job)]); gen = _Gen()
+    svc._maybe_return_to_solo(gen)
+    assert gen.removed == [7] and svc._active == {} and job.future.done()
+    res = job.future.result()
+    assert res["_resume_solo"] is True and res["tokens"] == [4, 5, 6] and res["finish_reason"] == "handover_return"
+
+
+def test_return_to_solo_leaves_other_shapes_alone():
+    gen = _Gen()
+    # two rows active
+    a, b = _cont_job([1]), _cont_job([2]); svc = _svc_with([(1, a), (2, b)]); svc._maybe_return_to_solo(gen)
+    # one row but something pending
+    c = _cont_job([1]); svc = _svc_with([(1, c)], pending=[SimpleNamespace(cancel_requested=lambda: False)]); svc._maybe_return_to_solo(gen)
+    # a fresh (non-continuation) row
+    d = _cont_job([1], continuation=False); svc = _svc_with([(1, d)]); svc._maybe_return_to_solo(gen)
+    # handover state was not banked
+    e = _cont_job([1], return_to_solo=False); svc = _svc_with([(1, e)]); svc._maybe_return_to_solo(gen)
+    # near the end of its budget
+    f = _cont_job(list(range(190)), max_tokens=200); svc = _svc_with([(1, f)]); svc._maybe_return_to_solo(gen)
+    assert gen.removed == [] and not any(j.future.done() for j in (a, b, c, d, e, f))
+
+
+def test_finish_lane_handover_resumes_on_the_solo_lane(monkeypatch):
+    monkeypatch.setattr(srv, "_default_stop_tokens", lambda tok: {99})
+    monkeypatch.setattr(srv, "_strip_terminal_stop", lambda toks, stops: [t for t in toks if t not in stops])
+    calls = {}
+    class _F:
+        def __init__(self, fn): self.fn = fn
+        def result(self): return self.fn()
+    monkeypatch.setattr(srv, "_submit_foreground_model_work", lambda state, fn, batch_key=None: _F(fn))
+    def fake_run_generation(state, prompt_ids, **kw):
+        calls["prompt_ids"] = list(prompt_ids); calls["max_tokens"] = kw.get("max_tokens")
+        return {"tokens": [7, 8, 99], "text": "hi", "stats": {"mode": "mtpk"}, "finish_reason": "stop"}
+    monkeypatch.setattr(srv, "_run_generation", fake_run_generation)
+    st = _state(_Service())
+    job = SimpleNamespace(future=Future(), max_tokens=100, request_id="r", session_id="s", request_observability={})
+    job.future.set_result({"_resume_solo": True, "tokens": [4, 5, 6], "stats": {"mode": "ar"}, "_token_times": [], "elapsed_s": 1.0})
+    marker = {"_handover_job": job, "_handover_solo_tokens": [1, 2, 3], "_handover_solo_token_times": [], "_handover_solo_stats": {}, "_handover_started": 0.0}
+    out = srv._finish_lane_handover(st, [10, 11], marker, {"max_tokens": 100, "temperature": 0.0})
+    assert calls["prompt_ids"] == [10, 11, 1, 2, 3, 4, 5, 6] and calls["max_tokens"] == 97, "resume prompt = prompt + solo + batched; budget minus batched"
+    assert out["tokens"] == [1, 2, 3, 4, 5, 6, 7, 8, 99] and out["text"] == "bcdefghi" and out["completion_tokens"] == 9
+    assert out["stats"]["scheduler_lane"] == "solo_mtp->ar_batch->solo_mtp"
+    assert out["stats"]["lane_handover"] == {"solo_tokens": 3, "batched_tokens": 3, "resumed_solo_tokens": 3, "solo_stats": {}}
+    assert st.fg == 0
+
+
+def test_submit_lane_continuation_banks_the_handover_state_for_the_return(monkeypatch):
+    monkeypatch.setattr(srv, "_default_stop_tokens", lambda tok: set())
+    monkeypatch.setattr(srv, "snapshot_cache", lambda cache: ("snap", cache))
+    monkeypatch.setattr(srv, "_bank_history_policy", lambda state: "committed")
+    monkeypatch.delenv("MTPLX_LANE_HANDOVER_RETURN", raising=False)
+    puts = []
+    bank = SimpleNamespace(put_snapshot=lambda **kw: puts.append(kw) or object())
+    service = _Service(); st = _state(service); st.draft_head_identity = "dh"
+    out = _out([30, 31, 32]); out.final_state.final_committed_mtp_cache = ["mtp"]
+    common = dict(request_id="r", response_max=50, sampler=SamplerConfig(), generation_seed=0, generation_limits={}, request_observability={},
+                  token_callback=None, prefill_callback=None, cancel_event=None, session_id="s1", session_bank=bank, session_restore_mode="cold",
+                  session_template_hash="t", session_draft_head_identity=None, session_policy_fingerprint="p", token_times=[], started=0.0)
+    srv._submit_lane_continuation(st, [1, 2, 3], out, **common)
+    job = service.jobs[-1]
+    assert job.return_to_solo is True and len(puts) == 1
+    put = puts[0]
+    assert put["token_ids"] == [1, 2, 3, 30, 31] and put["snapshot_epoch"] == 5 and put["mtp_snapshot_epoch"] == 5
+    assert put["cache_snapshot"] == ("snap", ["cache"]) and put["mtp_history_snapshot"] == ("snap", ["mtp"])
+    assert put["session_id"] == "s1" and put["policy_fingerprint"] == "p" and put["hidden_variant"] == "post_norm" and put["draft_head_identity"] == "dh"
+    # no MTP history -> banked without it, no return trip
+    out2 = _out([30, 31, 32]); out2.final_state.final_committed_mtp_cache = None
+    srv._submit_lane_continuation(st, [1, 2, 3], out2, **common)
+    assert service.jobs[-1].return_to_solo is False
