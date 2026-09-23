@@ -72,7 +72,7 @@ def test_handover_check_gates(monkeypatch):
     st = _state(_Service(pending=True))
     assert srv._make_handover_check(st, seed_is_explicit=False)() is True
     st2 = _state(_Service(pending=False)); st2.model_scheduler = SimpleNamespace(foreground_pending=lambda: 1)
-    assert srv._make_handover_check(st2, seed_is_explicit=False)() is True
+    assert srv._make_handover_check(st2, seed_is_explicit=False)() is False, "scheduler foreground work (commits) must not trigger a handover"
 
 
 def test_submit_lane_continuation_builds_the_insertable_job(monkeypatch):

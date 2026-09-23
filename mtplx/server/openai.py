@@ -4159,7 +4159,6 @@ def _make_handover_check(state: Any, *, seed_is_explicit: bool) -> Callable[[], 
     if seed_is_explicit or not _lane_handover_enabled(state):
         return None
     service = state.ar_batch_service
-    scheduler = getattr(state, "model_scheduler", None)
     min_solo_tokens = _lane_handover_min_solo_tokens()
     cooldown_s = _lane_handover_cooldown_s()
     polls = 0
@@ -4176,11 +4175,11 @@ def _make_handover_check(state: Any, *, seed_is_explicit: bool) -> Callable[[], 
         last_resume = float(getattr(state, "_lane_handover_last_resume_s", 0.0) or 0.0)
         if last_resume and time.perf_counter() - last_resume < cooldown_s:
             return False
+        # Only the lane's own queue counts: the scheduler's foreground queue also
+        # holds finished requests' commit work, which made a solo run hand over to
+        # an EMPTY batch and return at once (two rounds per request, live 02:5x).
         try:
-            if service.has_pending():
-                return True
-            pending = getattr(scheduler, "foreground_pending", None)
-            return bool(pending()) if callable(pending) else False
+            return bool(service.has_pending())
         except Exception:  # noqa: BLE001
             return False
 
