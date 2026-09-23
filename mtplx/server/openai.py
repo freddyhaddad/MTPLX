@@ -4051,6 +4051,7 @@ class _BatchedARJob:
         session_draft_head_identity: str | None = None,
         session_policy_fingerprint: str | None = None,
         seed_is_explicit: bool = False,
+        continuation: bool = False,
     ) -> None:
         self.request_id = request_id
         self.prompt_ids = [int(token) for token in prompt_ids]
@@ -4058,6 +4059,10 @@ class _BatchedARJob:
         self.sampler = sampler
         self.seed = int(seed)
         self.seed_is_explicit = bool(seed_is_explicit)
+        # A lane-handover continuation: insert_cache/insert_all_tokens carry a
+        # solo request's state (prompt + generated so far); no bank restore,
+        # no shared/stable prefix, no prompt-boundary commit.
+        self.continuation = bool(continuation)
         self.stop_token_ids = {int(token) for token in stop_token_ids}
         self.token_callback = token_callback
         self.prefill_callback = prefill_callback
@@ -4122,6 +4127,171 @@ class _BatchedARJob:
         if token not in self.stop_token_ids and self.token_callback is not None:
             self.token_callback([token])
         self.token_times.append(time.perf_counter())
+
+
+def _lane_handover_enabled(state: Any) -> bool:
+    """Solo MTP -> batched AR handover on arrival (MTPLX_LANE_HANDOVER=1; ar_batch mode only,
+    and only when the batched lane can serve this model's cache family)."""
+    raw = os.environ.get("MTPLX_LANE_HANDOVER", "0").strip().lower()
+    if raw not in {"1", "true", "yes", "on"}:
+        return False
+    if str(getattr(getattr(state, "args", None), "scheduler_mode", "")) != "ar_batch":
+        return False
+    service = getattr(state, "ar_batch_service", None)
+    return service is not None and not getattr(service, "ar_batch_unavailable_reason", None)
+
+
+def _make_handover_check(state: Any, *, seed_is_explicit: bool) -> Callable[[], bool] | None:
+    """The generator polls this after each sampled token: True when another request
+    is waiting on the batched lane behind this solo owner. Seeded requests never
+    hand over (the lane's sampler would not reproduce the seeded stream)."""
+    if seed_is_explicit or not _lane_handover_enabled(state):
+        return None
+    service = state.ar_batch_service
+    scheduler = getattr(state, "model_scheduler", None)
+
+    def check() -> bool:
+        try:
+            if service.has_pending():
+                return True
+            pending = getattr(scheduler, "foreground_pending", None)
+            return bool(pending()) if callable(pending) else False
+        except Exception:  # noqa: BLE001
+            return False
+
+    return check
+
+
+def _submit_lane_continuation(
+    state: Any,
+    prompt_ids: list[int],
+    out: Any,
+    *,
+    request_id: str | None,
+    response_max: int,
+    sampler: Any,
+    generation_seed: int,
+    generation_limits: dict[str, Any],
+    request_observability: dict[str, Any] | None,
+    token_callback: Callable[[list[int]], None] | None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None,
+    cancel_event: Any,
+    session_id: str | None,
+    session_bank: Any,
+    session_restore_mode: str,
+    session_template_hash: str | None,
+    session_draft_head_identity: str | None,
+    session_policy_fingerprint: str | None,
+    token_times: list[float],
+    started: float,
+) -> dict[str, Any]:
+    """Turn a solo run that returned finish_reason='handover' into a batched-lane
+    continuation job and submit it (from the owner thread this only appends to the
+    lane's queue; the pump is already scheduled behind this run). Returns the
+    marker the dispatcher waits on OUTSIDE the owner thread."""
+    from collections import Counter as _Counter
+
+    generated = [int(token) for token in out.tokens]
+    final_state = getattr(out, "final_state", None)
+    cache = getattr(final_state, "final_trunk_cache", None) if final_state is not None else None
+    if not generated or cache is None:
+        raise RuntimeError("handover without a cache or generated tokens")
+    observability = dict(request_observability or {})
+    observability["scheduler_lane"] = "solo_mtp->ar_batch"
+    observability["lane_handover"] = {
+        "solo_tokens": len(generated),
+        "solo_elapsed_s": round(time.perf_counter() - started, 3),
+    }
+    job = _BatchedARJob(
+        request_id=request_id or f"arbatch-{uuid.uuid4().hex}",
+        prompt_ids=prompt_ids,
+        max_tokens=max(1, int(response_max) - len(generated)),
+        sampler=sampler,
+        seed=generation_seed,
+        stop_token_ids=_default_stop_tokens(state.runtime.tokenizer),
+        token_callback=token_callback,
+        prefill_callback=prefill_callback,
+        request_observability=observability,
+        mtp_disabled_reason="lane_handover",
+        generation_limits=generation_limits,
+        cancel_event=cancel_event,
+        session_id=session_id,
+        session_bank=session_bank,
+        session_restore_mode=session_restore_mode,
+        session_template_hash=session_template_hash,
+        session_draft_head_identity=session_draft_head_identity,
+        session_policy_fingerprint=session_policy_fingerprint,
+        seed_is_explicit=False,
+        continuation=True,
+    )
+    job.insert_cache = cache
+    job.insert_all_tokens = [int(token) for token in prompt_ids] + generated[:-1]
+    job.insert_prompt_ids = [generated[-1]]
+    job.cached_tokens = len(job.insert_all_tokens)
+    job.session_cache_hit = True  # no prompt-boundary commit; the finished row banks the whole state
+    job.cache_miss_reason = None
+    job.effective_restore_mode = "lane_handover"
+    job.cache_source = "live"
+    job.completion_token_counts = _Counter(generated)
+    future = state.ar_batch_service.submit(job)
+    _log_json_event(
+        "lane_handover",
+        request_id=job.request_id,
+        session_id=session_id,
+        prompt_tokens=len(prompt_ids),
+        solo_tokens=len(generated),
+        remaining_max_tokens=job.max_tokens,
+    )
+    return {
+        "_handover_job": job,
+        "_handover_future": future,
+        "_handover_solo_tokens": generated,
+        "_handover_solo_token_times": list(token_times),
+        "_handover_solo_stats": out.stats.to_dict() if hasattr(out.stats, "to_dict") else {},
+        "_handover_started": started,
+        "finish_reason": "handover",
+    }
+
+
+def _finish_lane_handover(state: Any, prompt_ids: list[int], marker: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Wait for the continuation row (never on the owner thread) and finalize the
+    solo + batched segments as one response."""
+    job = marker["_handover_job"]
+    solo_tokens = list(marker["_handover_solo_tokens"])
+    state.begin_foreground()
+    try:
+        generated = job.future.result()
+    finally:
+        state.end_foreground()
+    generated = dict(generated)
+    all_tokens = solo_tokens + [int(token) for token in generated.get("tokens") or []]
+    stop_ids = _default_stop_tokens(state.runtime.tokenizer)
+    generated["tokens"] = all_tokens
+    generated["text"] = state.runtime.tokenizer.decode(_strip_terminal_stop(all_tokens, stop_ids))
+    generated["completion_tokens"] = len(all_tokens)
+    generated["_token_times"] = list(marker.get("_handover_solo_token_times") or []) + list(generated.get("_token_times") or [])
+    elapsed_s = max(0.0, time.perf_counter() - float(marker["_handover_started"]))
+    generated["elapsed_s"] = elapsed_s
+    generated["tok_s"] = len(all_tokens) / elapsed_s if elapsed_s > 0 else 0.0
+    stats = dict(generated.get("stats") or {})
+    stats["scheduler_lane"] = "solo_mtp->ar_batch"
+    stats["generated_tokens"] = len(all_tokens)
+    stats["lane_handover"] = {
+        "solo_tokens": len(solo_tokens),
+        "batched_tokens": len(all_tokens) - len(solo_tokens),
+        "solo_stats": marker.get("_handover_solo_stats") or {},
+    }
+    generated["stats"] = stats
+    return _finalize_batched_ar_generation(
+        state,
+        prompt_ids,
+        generated,
+        session_id=kwargs.get("session_id"),
+        session_cache_hit=bool(kwargs.get("session_cache_hit")),
+        cache_miss_reason=kwargs.get("cache_miss_reason"),
+        session_restore_mode="solo_mtp->ar_batch",
+        request_observability=job.request_observability,
+    )
 
 
 def _log_json_event(event: str, **fields: Any) -> None:
@@ -4195,6 +4365,10 @@ class _BatchedARGenerationService:
         self._pump_scheduled = False
         self._last_batch_size = 0
         self._last_error: str | None = None
+
+    def has_pending(self) -> bool:
+        with self._condition:
+            return any(not job.cancel_requested() for job in self._pending)
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
@@ -4726,10 +4900,11 @@ class _BatchedARGenerationService:
                 )
 
     def _prepare_prompt_inputs(self, jobs: list[_BatchedARJob]) -> None:
-        for job in jobs:
+        fresh = [job for job in jobs if not getattr(job, "continuation", False)]
+        for job in fresh:
             self._prepare_session_bank_restore(job)
-        self._prepare_shared_prefix(jobs)
-        for job in jobs:
+        self._prepare_shared_prefix(fresh)
+        for job in fresh:
             self._prepare_stable_prefix(job)
 
     @staticmethod
@@ -25900,12 +26075,18 @@ def _run_generation_dispatched(
             and hasattr(scheduler, "is_owner_thread")
             and scheduler.is_owner_thread()
         ):
-            return submitted_run()
-        return _submit_foreground_model_work(
-            state,
-            submitted_run,
-            batch_key=batch_key,
-        ).result()
+            result = submitted_run()
+        else:
+            result = _submit_foreground_model_work(
+                state,
+                submitted_run,
+                batch_key=batch_key,
+            ).result()
+        if isinstance(result, dict) and result.get("_handover_job") is not None:
+            # Lane handover: the solo run returned a continuation marker; wait for
+            # the batched row here, off the owner thread, and finalize once.
+            return _finish_lane_handover(state, prompt_ids, result, kwargs)
+        return result
     finally:
         # Settles hyper tickets whose work item never started (cancelled
         # futures / submit failures); a no-op for started tickets and for
@@ -26414,6 +26595,7 @@ def _run_generation(
                         prompt_ids,
                         constraint=constraint,
                         vision_splice=vision_splice,
+                        handover_check=_make_handover_check(state, seed_is_explicit=seed_is_explicit),
                         abort_check=(
                             (
                                 lambda: bool(
@@ -26494,6 +26676,29 @@ def _run_generation(
                             state.args.online_hidden_corrector_key
                         ),
                     )
+                    if getattr(out, "finish_reason", None) == "handover":
+                        return _submit_lane_continuation(
+                            state,
+                            prompt_ids,
+                            out,
+                            request_id=(request_observability or {}).get("request_id"),
+                            response_max=response_max,
+                            sampler=sampler,
+                            generation_seed=generation_seed,
+                            generation_limits=generation_limits,
+                            request_observability=request_observability,
+                            token_callback=record_tokens,
+                            prefill_callback=prefill_callback,
+                            cancel_event=cancel_event,
+                            session_id=session_id,
+                            session_bank=session_bank,
+                            session_restore_mode=session_restore_mode,
+                            session_template_hash=session_template_hash,
+                            session_draft_head_identity=session_draft_head_identity,
+                            session_policy_fingerprint=session_policy_fingerprint,
+                            token_times=token_times,
+                            started=started,
+                        )
         except PostcommitAbort:
             # abort_check tripped inside the prefill. Two arms share it: a
             # client disconnect reuses the exact cancellation path decode
