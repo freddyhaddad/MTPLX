@@ -4430,7 +4430,28 @@ class _BatchedARGenerationService:
                 policy_fingerprint=job.session_policy_fingerprint,
             )
             ram_miss = getattr(job.session_bank, "last_ram_miss_reason", None)
+            if restored is not None and int(restored.entry.prefix_len) >= len(job.prompt_ids):
+                # The exact entry is LONGER than the prompt (previous turn's prompt +
+                # generation): nothing is left to insert, and the recurrent state
+                # cannot be trimmed back. The solo lane serves this through the
+                # boundary restore; do the same instead of refusing (2026-09-24
+                # quiet-box 20k receipt: ar_batch_full_prefix_not_insertable, 35 s
+                # cold prefill while the solo lane restored all 19.5k tokens).
+                restored = None
+                if self._prepare_near_prefix_restore(job):
+                    return True
+                job.cache_miss_reason = "ar_batch_full_prefix_not_insertable"
+                return False
             if restored is None and restore_mode == "clone" and ram_miss == "no_snapshot_coverage":
+                peek = getattr(job.session_bank, "longest_prefix", None)
+                entry = peek(job.prompt_ids) if callable(peek) else None
+                if entry is not None and int(getattr(entry, "prefix_len", 0)) >= len(job.prompt_ids):
+                    # A lease would consume the live reference for nothing: the
+                    # entry is not insertable either. Boundary restore instead.
+                    if self._prepare_near_prefix_restore(job):
+                        return True
+                    job.cache_miss_reason = "ar_batch_full_prefix_not_insertable"
+                    return False
                 # The entry is a live reference (the solo lane leases the live
                 # cache for coding-agent tool sessions instead of snapshotting
                 # it), so a clone has nothing to copy. Take the lease the same
