@@ -8047,6 +8047,7 @@ def generate_mtpk(
     prompt_ids: list[int],
     *,
     abort_check: Callable[[], bool] | None = None,
+    handover_check: Callable[[], bool] | None = None,
     max_tokens: int,
     sampler: SamplerConfig,
     speculative_depth: int,
@@ -10072,6 +10073,20 @@ def generate_mtpk(
         )
         if _draft_k20_prescatter_plan is not None:
             _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
+    # Lane handover (solo MTP -> batched AR when another request arrives): polled
+    # only at the point where the trunk cache holds prompt + tokens[:-1] and the
+    # last token is sampled but not forwarded, which is exactly the shape the
+    # batch generator inserts. The caller decides what "another request" means.
+    handover_requested = False
+
+    def _handover_now() -> bool:
+        if handover_check is None or constraint is not None or a3b_rebase_state is not None:
+            return False
+        try:
+            return bool(handover_check())
+        except Exception:  # noqa: BLE001 - a broken check never stops decode
+            return False
+
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -10181,7 +10196,14 @@ def generate_mtpk(
                 # FOLLOW the primary, so consume it now.
                 constraint.advance_many(tokens[constraint_synced_tokens:])
                 constraint_synced_tokens = len(tokens)
+            if _handover_now():
+                pending_primary = primary  # sampled, emitted, not forwarded
+                handover_requested = True
+                break
         else:
+            if _handover_now():
+                handover_requested = True  # pending_primary stays set, same shape
+                break
             primary = pending_primary
             pending_primary = None
         planned_depth = (
@@ -13388,6 +13410,7 @@ def generate_mtpk(
         and pending_primary is not None
         and tokens
         and repetition_result is None
+        and not handover_requested  # the continuation lane forwards the pending token
     ):
         try:
             pending_token = int(pending_primary)
@@ -13494,7 +13517,10 @@ def generate_mtpk(
             )
             else "unknown"
         )
-    if capture_final_state:
+    if handover_requested:
+        finish_reason = "handover"
+        stop_origin = None
+    if capture_final_state or handover_requested:
         final_state = GenerationFinalState(
             final_trunk_cache=cache,
             final_logits=logits,
