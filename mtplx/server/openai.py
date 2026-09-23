@@ -4124,6 +4124,13 @@ class _BatchedARJob:
         self.token_times.append(time.perf_counter())
 
 
+def _log_json_event(event: str, **fields: Any) -> None:
+    try:
+        print(json.dumps({"event": event, **fields}, default=str), flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # Batched lane: bank the stable prefix (prompt minus the transient trailing hint) per turn.
 _STABLE_PREFIX_BANK_MIN_TOKENS = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_MIN_TOKENS", "512"))
 _STABLE_PREFIX_PREFILL_CHUNK = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_CHUNK", "2048"))
@@ -4321,6 +4328,7 @@ class _BatchedARGenerationService:
             return
         if isinstance(outcome, dict) and outcome.get("waited"):
             job.request_observability["ar_batch_postcommit_wait"] = outcome
+            _log_json_event("ar_batch_postcommit_wait", request_id=job.request_id, session_id=job.session_id, **{k: v for k, v in outcome.items() if isinstance(v, (str, int, float, bool))})
 
     def _prepare_session_bank_restore(self, job: _BatchedARJob) -> bool:
         if job.session_bank is None or len(job.prompt_ids) < 2:
@@ -4551,6 +4559,14 @@ class _BatchedARGenerationService:
         stable = self._stable_prefix_len(job)
         bank = getattr(job, "session_bank", None)
         if stable is None or bank is None or job.cancel_requested():
+            _log_json_event(
+                "ar_batch_stable_prefix_skipped",
+                request_id=job.request_id,
+                session_id=job.session_id,
+                reason=("no_stable_prefix_len" if stable is None else "no_bank" if bank is None else "cancelled"),
+                stable_prefix_len_raw=job.request_observability.get("stable_prefix_len"),
+                prompt_len=len(job.prompt_ids),
+            )
             return
         if any(int(token) >= (1 << 40) for token in job.prompt_ids[:stable]):
             return  # vision surrogate ids never enter the batched bank path
@@ -4595,6 +4611,7 @@ class _BatchedARGenerationService:
                 stored = entry is not None
         except Exception as exc:  # noqa: BLE001
             job.request_observability["ar_batch_stable_prefix_error"] = f"{type(exc).__name__}: {exc}"
+            _log_json_event("ar_batch_stable_prefix_error", request_id=job.request_id, error=f"{type(exc).__name__}: {exc}")
             return
         job.insert_cache = cache
         job.insert_all_tokens = list(job.prompt_ids[:stable])
@@ -4603,6 +4620,16 @@ class _BatchedARGenerationService:
         job.request_observability["ar_batch_stable_prefix_tokens"] = stable
         job.request_observability["ar_batch_stable_prefix_prefilled"] = stable - start
         job.request_observability["ar_batch_stable_prefix_bank_stored"] = stored
+        _log_json_event(
+            "ar_batch_stable_prefix",
+            request_id=job.request_id,
+            session_id=job.session_id,
+            stable_prefix_len=stable,
+            restored_prefix=start,
+            prefilled=stable - start,
+            bank_stored=stored,
+            prepare_s=round(time.perf_counter() - prepare_started, 3),
+        )
 
     @staticmethod
     def _cache_supports_batch_history_merge(cache: list[Any] | None) -> bool:
