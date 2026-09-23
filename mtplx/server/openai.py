@@ -4141,6 +4141,17 @@ def _lane_handover_enabled(state: Any) -> bool:
     return service is not None and not getattr(service, "ar_batch_unavailable_reason", None)
 
 
+def _lane_handover_return_enabled() -> bool:
+    return os.environ.get("MTPLX_LANE_HANDOVER_RETURN", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lane_handover_return_min_tokens() -> int:
+    try:
+        return max(1, int(os.environ.get("MTPLX_LANE_HANDOVER_RETURN_MIN_TOKENS", "32")))
+    except ValueError:
+        return 32
+
+
 def _make_handover_check(state: Any, *, seed_is_explicit: bool) -> Callable[[], bool] | None:
     """The generator polls this after each sampled token: True when another request
     is waiting on the batched lane behind this solo owner. Seeded requests never
@@ -4233,6 +4244,36 @@ def _submit_lane_continuation(
     job.effective_restore_mode = "lane_handover"
     job.cache_source = "live"
     job.completion_token_counts = _Counter(generated)
+    job.solo_prompt_ids = [int(token) for token in prompt_ids]
+    job.return_to_solo = False
+    # Bank the solo state (with its MTP history) so the return trip can resume on the
+    # solo lane from an exact prefix (prompt + g[:-1]) plus a suffix prefill of the
+    # tokens the batch generates. The live cache goes to the batch, so bank a clone.
+    if session_bank is not None and _lane_handover_return_enabled():
+        try:
+            mtp_cache = getattr(final_state, "final_committed_mtp_cache", None)
+            snapshot = snapshot_cache(cache)
+            history_snapshot = snapshot_cache(mtp_cache) if mtp_cache is not None else None
+            ids = job.insert_all_tokens
+            entry = session_bank.put_snapshot(
+                runtime=state.runtime,
+                token_ids=list(ids),
+                cache_snapshot=snapshot,
+                logits=None,
+                hidden=None,
+                hidden_variant="post_norm",
+                session_id=session_id,
+                template_hash=session_template_hash,
+                mtp_history_policy=_bank_history_policy(state),
+                draft_head_identity=getattr(state, "draft_head_identity", None),
+                policy_fingerprint=session_policy_fingerprint,
+                mtp_history_snapshot=history_snapshot,
+                snapshot_epoch=len(ids),
+                mtp_snapshot_epoch=len(ids) if history_snapshot is not None else None,
+            )
+            job.return_to_solo = entry is not None and history_snapshot is not None
+        except Exception as exc:  # noqa: BLE001 - the forward handover never depends on this
+            observability["lane_handover_bank_error"] = f"{type(exc).__name__}: {exc}"
     future = state.ar_batch_service.submit(job)
     _log_json_event(
         "lane_handover",
@@ -4241,6 +4282,7 @@ def _submit_lane_continuation(
         prompt_tokens=len(prompt_ids),
         solo_tokens=len(generated),
         remaining_max_tokens=job.max_tokens,
+        return_to_solo=job.return_to_solo,
     )
     return {
         "_handover_job": job,
@@ -4253,9 +4295,17 @@ def _submit_lane_continuation(
     }
 
 
-def _finish_lane_handover(state: Any, prompt_ids: list[int], marker: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+def _finish_lane_handover(
+    state: Any,
+    prompt_ids: list[int],
+    marker: dict[str, Any],
+    kwargs: dict[str, Any],
+    prefix_tokens: list[int] | None = None,
+) -> dict[str, Any]:
     """Wait for the continuation row (never on the owner thread) and finalize the
-    solo + batched segments as one response."""
+    solo + batched segments as one response. ``prefix_tokens`` are tokens already
+    generated before this marker's solo segment (earlier hand-over rounds)."""
+    prefix_tokens = list(prefix_tokens or [])
     job = marker["_handover_job"]
     solo_tokens = list(marker["_handover_solo_tokens"])
     state.begin_foreground()
@@ -4264,8 +4314,42 @@ def _finish_lane_handover(state: Any, prompt_ids: list[int], marker: dict[str, A
     finally:
         state.end_foreground()
     generated = dict(generated)
-    all_tokens = solo_tokens + [int(token) for token in generated.get("tokens") or []]
+    batched_tokens = [int(token) for token in generated.get("tokens") or []]
     stop_ids = _default_stop_tokens(state.runtime.tokenizer)
+    if generated.get("_resume_solo"):
+        # Return trip: the batch drained to this row; resume on the solo MTP lane from
+        # the banked handover state (exact prefix prompt + g[:-1], suffix prefill of the
+        # batched tokens) for the remaining budget, then merge all segments.
+        so_far = prefix_tokens + solo_tokens + batched_tokens
+        remaining = max(1, int(job.max_tokens) - len(batched_tokens))
+        resume_kwargs = dict(kwargs)
+        resume_kwargs["max_tokens"] = remaining
+        resume_kwargs.pop("mtp_batch_finalize_ownership", None)
+        resume_prompt = [int(token) for token in prompt_ids] + so_far
+        _log_json_event("lane_handover_resume", request_id=job.request_id, session_id=job.session_id,
+                        resume_prompt_tokens=len(resume_prompt), batched_tokens=len(batched_tokens), remaining_max_tokens=remaining)
+        result = _submit_foreground_model_work(
+            state, lambda: _run_generation(state, resume_prompt, **resume_kwargs), batch_key="chat.stream"
+        ).result()
+        if isinstance(result, dict) and result.get("_handover_job") is not None:
+            return _finish_lane_handover(state, prompt_ids, result, kwargs, prefix_tokens=so_far)
+        result = dict(result)
+        all_tokens = so_far + [int(token) for token in result.get("tokens") or []]
+        result["tokens"] = all_tokens
+        result["text"] = state.runtime.tokenizer.decode(_strip_terminal_stop(all_tokens, stop_ids))
+        result["completion_tokens"] = len(all_tokens)
+        stats = dict(result.get("stats") or {})
+        stats["scheduler_lane"] = "solo_mtp->ar_batch->solo_mtp"
+        stats["generated_tokens"] = len(all_tokens)
+        stats["lane_handover"] = {
+            "solo_tokens": len(prefix_tokens) + len(solo_tokens),
+            "batched_tokens": len(batched_tokens),
+            "resumed_solo_tokens": len(all_tokens) - len(so_far),
+            "solo_stats": marker.get("_handover_solo_stats") or {},
+        }
+        result["stats"] = stats
+        return result
+    all_tokens = prefix_tokens + solo_tokens + batched_tokens
     generated["tokens"] = all_tokens
     generated["text"] = state.runtime.tokenizer.decode(_strip_terminal_stop(all_tokens, stop_ids))
     generated["completion_tokens"] = len(all_tokens)
@@ -4277,8 +4361,8 @@ def _finish_lane_handover(state: Any, prompt_ids: list[int], marker: dict[str, A
     stats["scheduler_lane"] = "solo_mtp->ar_batch"
     stats["generated_tokens"] = len(all_tokens)
     stats["lane_handover"] = {
-        "solo_tokens": len(solo_tokens),
-        "batched_tokens": len(all_tokens) - len(solo_tokens),
+        "solo_tokens": len(prefix_tokens) + len(solo_tokens),
+        "batched_tokens": len(batched_tokens),
         "solo_stats": marker.get("_handover_solo_stats") or {},
     }
     generated["stats"] = stats
@@ -5467,6 +5551,7 @@ class _BatchedARGenerationService:
                             self._active.pop(uid, None)
                         self._commit_finished_row(job, response)
                         self._complete_job(job, finish_reason=str(finish_reason))
+                self._maybe_return_to_solo(generator)
                 _owner_settled_pump_step(prompt_responses, generation_responses)
         except BaseException as exc:
             self._fail_all(exc)
@@ -5486,6 +5571,50 @@ class _BatchedARGenerationService:
                         batch_key="ar_batch.pump",
                     )
                 self._condition.notify_all()
+
+    def _maybe_return_to_solo(self, generator: Any) -> None:
+        """Lane handover return trip: when the batch has drained to a single
+        continuation row that was handed over from the solo MTP lane (and its
+        handover state is banked), with nothing pending, take the row out of the
+        batch and resolve its future with a resume marker; the dispatcher resumes
+        it on the solo lane. A row near the end of its budget is left alone."""
+        with self._condition:
+            if len(self._active) != 1 or any(not j.cancel_requested() for j in self._pending):
+                return
+            uid, job = next(iter(self._active.items()))
+            if not (getattr(job, "continuation", False) and getattr(job, "return_to_solo", False)):
+                return
+            if job.future.done() or not job.tokens:
+                return
+            if int(job.max_tokens) - len(job.tokens) < _lane_handover_return_min_tokens():
+                return
+            self._active.pop(uid, None)
+        try:
+            generator.remove([uid])
+        except Exception as exc:  # noqa: BLE001
+            if not job.future.done():
+                job.future.set_exception(exc)
+            return
+        completed = time.perf_counter()
+        _log_json_event(
+            "lane_handover_return",
+            request_id=job.request_id,
+            session_id=job.session_id,
+            batched_tokens=len(job.tokens),
+            remaining_max_tokens=int(job.max_tokens) - len(job.tokens),
+        )
+        if not job.future.done():
+            job.future.set_result(
+                {
+                    "_resume_solo": True,
+                    "tokens": list(job.tokens),
+                    "text": "",
+                    "stats": {"mode": "ar", "generation_mode": "ar", "generated_tokens": len(job.tokens)},
+                    "_token_times": list(getattr(job, "token_times", []) or []),
+                    "elapsed_s": max(0.0, completed - job.created_s),
+                    "finish_reason": "handover_return",
+                }
+            )
 
     def _remove_cancelled_active(self, generator: Any) -> None:
         with self._condition:
