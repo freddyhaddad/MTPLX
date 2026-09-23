@@ -3548,6 +3548,104 @@ def _tail_by_lengths(seq: mx.array, n_keep: int, cache, S: int) -> mx.array:
     return mx.take_along_axis(seq, positions, axis=1)
 
 
+def _qsa_batched_decode_enabled() -> bool:
+    """Batched QSA decode (B>1, S=1) in plain MLX ops: one scoring matmul and one
+    SDPA over the batch instead of the per-row loop; the per-row cache writes and
+    gathers stay per row. Opt-in (MTPLX_QSA_BATCHED_DECODE=1) until measured."""
+    raw = (os.environ.get("MTPLX_QSA_BATCHED_DECODE") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _qsa_batched_decode(attn, x: mx.array, cache: "BatchQSACache") -> Optional[mx.array]:
+    """Batched decode step for B rows, each with its own single-sequence QSACache.
+
+    Numerically this is the single-row eager lane (indexer scores -> top-k blocks
+    -> gather selected tokens + tail -> dense SDPA over the gathered keys), run
+    once for the whole batch. Returns None when a row is outside the sparse
+    regime or the layer is in a configuration this path does not cover, and the
+    caller falls back to the per-row loop."""
+    B, S, _ = x.shape
+    idx = attn.indexer
+    if S != 1 or idx is None or vision_rope_state() is not None or attn._verify_glue_rope(1):
+        return None
+    rows = cache.rows
+    if any(getattr(r, "fixed_capacity", False) for r in rows):
+        return None
+    ratio = idx.ratio
+    # ---- projections (already batched)
+    fused = getattr(attn, "qkv_fused", None)
+    if fused is not None:
+        outs = fused(x)
+        if len(outs) == 4:
+            q, k, v, idx_rows = outs
+        else:
+            (q, k, v), idx_rows = outs, None
+    else:
+        q, k, v = attn.q_proj(x), attn.k_proj(x), attn.v_proj(x)
+        idx_rows = None
+    qk = idx.index_qk_proj(x) if idx_rows is None else idx_rows
+    iq, ik = mx.split(qk, [idx.n_heads * idx.head_dim], axis=-1)
+    iq = iq.reshape(B, 1, idx.n_heads, idx.head_dim)
+    ik = ik.reshape(B, 1, idx.head_dim)
+    q, gate = mx.split(q.reshape(B, 1, attn.n_heads, -1), 2, axis=-1)
+    gate = gate.reshape(B, 1, -1)
+    k = attn.k_norm(k.reshape(B, 1, attn.n_kv_heads, -1))
+    v = v.reshape(B, 1, attn.n_kv_heads, -1)
+    q = attn.q_norm(q)
+    # ---- per-row: indexer key/pooled writes, sparse-regime check, rope, KV append
+    totals, nb_list, pooled_t, tails, kvs, q_rows = [], [], [], [], [], []
+    for i, row in enumerate(rows):
+        pos = row.offset
+        total = pos + 1
+        if total // ratio <= idx.block_topk:
+            return None  # dense regime for this row: per-row loop handles it
+        qi = idx._prepare_queries_eager(iq[i : i + 1], pos)
+        row.write_raw(ik[i : i + 1])
+        pooled = idx._extend_pooled(row, total)
+        nb = 0 if pooled is None else pooled.shape[1]
+        positions = mx.array([pos], dtype=mx.int32)
+        cos, sin = _rope_cos_sin(positions, attn._inv_freq, attn._rope_attention_scaling)
+        qr = _apply_partial_rope(q[i : i + 1], cos, sin).transpose(0, 2, 1, 3)
+        kr = _apply_partial_rope(k[i : i + 1], cos, sin).transpose(0, 2, 1, 3)
+        vr = v[i : i + 1].transpose(0, 2, 1, 3)
+        kf, vf = row.kv.update_and_fetch(kr, vr)
+        totals.append(total); nb_list.append(nb); pooled_t.append(row.pooled_f32_view(nb)[0, 0])
+        tails.append(((pos + 1) // ratio) * ratio); kvs.append((kf, vf)); q_rows.append((qi, qr))
+    # ---- batched scoring over pooled block keys (padded to the longest row)
+    nb_max = max(nb_list)
+    D = pooled_t[0].shape[0]
+    pooled_b = mx.stack([mx.pad(t, [(0, 0), (0, nb_max - t.shape[1])]) if t.shape[1] < nb_max else t for t in pooled_t])  # [B, D, nb_max]
+    iq_b = mx.concatenate([qi for qi, _ in q_rows], axis=0).astype(mx.float32)  # [B, 1, H, d]
+    scores = mx.matmul(iq_b, pooled_b[:, None])  # [B, 1, H, nb_max]
+    scores = (mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(idx.head_dim))[:, 0]  # [B, nb_max]
+    blk = mx.arange(nb_max, dtype=mx.int32)
+    nb_q = mx.array([(t) // ratio for t in totals], dtype=mx.int32)  # complete blocks visible (pos+1)//ratio
+    valid = blk[None, :] < nb_q[:, None]
+    neg = mx.array(-mx.inf, dtype=mx.float32)
+    masked = mx.where(valid, scores, neg) - blk.astype(mx.float32)[None, :] * 1e-12
+    k_eff = min(idx.block_topk, nb_max)
+    top_idx = mx.argpartition(masked, kth=nb_max - k_eff, axis=-1)[:, nb_max - k_eff :]
+    top_ok = mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+    top_idx = mx.sort(mx.where(top_ok, top_idx.astype(mx.int32), mx.array(-1, dtype=mx.int32)), axis=-1)
+    # ---- gather the selected blocks + the causal tail block, fixed width per row (no host syncs):
+    # invalid (-1) blocks and the tail positions beyond each row's length point at token 0 and are masked.
+    tok = (mx.where(top_idx >= 0, top_idx, mx.array(0, dtype=mx.int32))[:, :, None] * ratio
+           + mx.arange(ratio, dtype=mx.int32)[None, None, :]).reshape(B, -1)  # [B, k_eff*ratio]
+    tok_ok = mx.repeat(top_idx >= 0, ratio, axis=1)
+    tail = mx.array(tails, dtype=mx.int32)[:, None] + mx.arange(ratio, dtype=mx.int32)[None, :]  # [B, ratio]
+    tail_ok = tail < mx.array(totals, dtype=mx.int32)[:, None]
+    ids = mx.concatenate([tok, tail], axis=1)
+    ok = mx.concatenate([tok_ok, tail_ok], axis=1)
+    ids = mx.where(ok, ids, mx.array(0, dtype=mx.int32))
+    k_b = mx.concatenate([mx.take(kvs[i][0], ids[i], axis=2) for i in range(B)], axis=0)  # [B, H_kv, W, D]
+    v_b = mx.concatenate([mx.take(kvs[i][1], ids[i], axis=2) for i in range(B)], axis=0)
+    q_b = mx.concatenate([qr for _, qr in q_rows], axis=0)  # [B, H, 1, D]
+    mask = ok[:, None, None, :]  # [B, 1, 1, W]
+    out = _verify_sdpa(q_b, k_b, v_b, scale=attn.scale, mask=mask)
+    out = out.transpose(0, 2, 1, 3).reshape(B, 1, -1)
+    return attn.o_proj(out * mx.sigmoid(gate))
+
+
 def _qsa_batched_forward(attn, x: mx.array, cache: "BatchQSACache") -> mx.array:
     """Batch-lane QSA forward: run the single-row layer once per row.
 
@@ -3563,6 +3661,10 @@ def _qsa_batched_forward(attn, x: mx.array, cache: "BatchQSACache") -> mx.array:
         )
     if B == 1:
         return attn(x, cache.rows[0])
+    if x.shape[1] == 1 and _qsa_batched_decode_enabled():
+        batched = _qsa_batched_decode(attn, x, cache)
+        if batched is not None:
+            return batched
     outs = [attn(x[i : i + 1], cache.rows[i]) for i in range(B)]
     return mx.concatenate(outs, axis=0)
 
