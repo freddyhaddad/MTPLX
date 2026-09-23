@@ -2034,6 +2034,11 @@ def _qsa_rows_gather_kv_route(cache: Any, rows: int) -> Any:
     return _qsa_stock_rows_gather_kv
 
 
+# Batched AR lane (#420): the compiled GDN decode runs are shape-generic, but B > 1 through them is
+# opt-in until measured on the real model. MTPLX_GDN_COMPILED_BATCH=1 enables it.
+_GDN_COMPILED_BATCH = os.environ.get("MTPLX_GDN_COMPILED_BATCH", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
@@ -5361,7 +5366,7 @@ class Qwen4ExpTextModel(nn.Module):
             # GDN states are S-invariant so the same run fns serve all
             # widths. Prefill and masked/padded forwards stay eager.
             1 <= h.shape[1] <= 4
-            and h.shape[0] == 1  # batched AR lane (#420) stays on the eager layers
+            and (h.shape[0] == 1 or _GDN_COMPILED_BATCH)  # batched AR lane (#420): eager unless opted in
             and ssm_mask is None
             and not self._gdn_compile_explicit_off
             and (self._gdn_compiled_env or self._gdn_compiled_lane)
