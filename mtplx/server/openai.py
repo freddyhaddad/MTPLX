@@ -4501,6 +4501,17 @@ def _ar_batch_decode_steps_per_chunk() -> int:
         return 1
 
 
+def _ar_batch_prefill_batch_size(config_dict: dict[str, Any]) -> int:
+    decode_max = max(1, int(config_dict["decode_batch_max"]))
+    raw = os.environ.get("MTPLX_AR_BATCH_PREFILL_BATCH_SIZE", "").strip()
+    if raw:
+        try:
+            return max(1, min(decode_max, int(raw)))
+        except ValueError:
+            pass
+    return max(1, min(4, decode_max))
+
+
 def _ar_batch_admission_chunk_tokens() -> int:
     """Prefill chunk for the step in which new rows enter the prompt batch
     (MTPLX_AR_BATCH_ADMISSION_CHUNK_TOKENS, default 256): a short prompt that
@@ -4611,7 +4622,16 @@ def _interleaved_batch_generator_class(base: type) -> type:
                 self._prompt_tokens_counter += sum(len(p) for p in prompts)
                 tic = time.perf_counter()
                 self._prompt_batch.prompt(prompts)
-                self._prompt_time_counter += time.perf_counter() - tic
+                chunk_s = time.perf_counter() - tic
+                self._prompt_time_counter += chunk_s
+                if admitted or split:
+                    _log_json_event(
+                        "ar_batch_step",
+                        admitted=int(n) if admitted else 0,
+                        split=len(split),
+                        rows=[len(p) for p in prompts],
+                        chunk_s=round(chunk_s, 3),
+                    )
             return prompt_responses, generation_responses
 
     return _InterleavedBatchGenerator
@@ -5363,6 +5383,7 @@ class _BatchedARGenerationService:
                     "request_id": job.request_id,
                 }
             )
+        insert_started = time.perf_counter()
         uids = generator.insert(
             [job.insert_prompt_ids for job in pending],
             max_tokens=[job.max_tokens for job in pending],
@@ -5370,11 +5391,27 @@ class _BatchedARGenerationService:
             all_tokens=[job.insert_all_tokens for job in pending],
             samplers=[self._make_sampler(job) for job in pending],
         )
+        insert_s = time.perf_counter() - insert_started
         with self._condition:
             for uid, job in zip(uids, pending):
                 job.uid = int(uid)
                 self._active[int(uid)] = job
             self._condition.notify_all()
+        _log_json_event(
+            "ar_batch_admit",
+            rows=[
+                {
+                    "request_id": job.request_id,
+                    "continuation": bool(job.continuation),
+                    "cached": int(job.cached_tokens or 0),
+                    "to_prefill": int(len(job.insert_prompt_ids or [])),
+                    "queue_wait_s": round(max(0.0, now - float(getattr(job, "created_s", now) or now)), 3),
+                }
+                for job in pending
+            ],
+            prepare_s=round(time.perf_counter() - now - insert_s, 3),
+            insert_s=round(insert_s, 3),
+        )
 
     def _commit_prompt_boundary(self, job: _BatchedARJob, generator: Any, uid: int) -> None:
         """Store a batched row's PROMPT-ONLY state at its first generation step.
@@ -5645,7 +5682,12 @@ class _BatchedARGenerationService:
             # cap 2 = 266 pp tok/s aggregate at 22 GB peak; cap 8 = 178 pp
             # tok/s at 74.5 GB peak — wide concurrent prefill thrashes
             # working-set memory and is slower end to end.
-            prefill_batch_size=max(1, min(2, int(config_dict["decode_batch_max"]))),
+            # Raised from 2 to 4 with the short admission chunk (2026-09-24):
+            # a lane whose prompt batch holds one long continuation could
+            # admit only ONE newcomer at a time, each waiting a full chunk of
+            # the long row for the slot. MTPLX_AR_BATCH_PREFILL_BATCH_SIZE
+            # overrides.
+            prefill_batch_size=_ar_batch_prefill_batch_size(config_dict),
             prefill_step_size=max(1, int(config_dict["prefill_chunk_tokens"])),
         )
         idle_deadline_s: float | None = None
