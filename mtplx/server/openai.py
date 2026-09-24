@@ -4200,6 +4200,51 @@ def _lane_handover_cooldown_s() -> float:
         return 5.0
 
 
+def _lane_handover_prefill_enabled() -> bool:
+    """Prefill-phase handover (MTPLX_LANE_HANDOVER_PREFILL, default on with the
+    lane handover): a solo run whose PROMPT is still prefilling hands its partial
+    cache to the batched lane when another request arrives, and the lane prefills
+    the rest interleaved with its rows. Without it a cold 100k-token prompt kept
+    every joiner waiting for its whole prefill (~100 s live, 2026-09-24)."""
+    raw = os.environ.get("MTPLX_LANE_HANDOVER_PREFILL", "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _lane_handover_prefill_min_remaining_tokens() -> int:
+    """Below this many prompt tokens left, finishing the solo prefill is faster
+    than moving the cache (one chunk is ~2 s; a handover costs a batch insert
+    and the interleaved prefill runs slower)."""
+    try:
+        return max(1, int(os.environ.get("MTPLX_LANE_HANDOVER_PREFILL_MIN_REMAINING_TOKENS", "4096")))
+    except ValueError:
+        return 4096
+
+
+def _make_prefill_handover_check(
+    state: Any, *, seed_is_explicit: bool
+) -> Callable[[int, int], bool] | None:
+    """Polled by the solo prefill at every chunk boundary with
+    (prefix_len_in_cache, prompt_len): True hands the partial cache over."""
+    if seed_is_explicit or not _lane_handover_enabled(state) or not _lane_handover_prefill_enabled():
+        return None
+    service = state.ar_batch_service
+    min_remaining = _lane_handover_prefill_min_remaining_tokens()
+    cooldown_s = _lane_handover_cooldown_s()
+
+    def check(prefix_len: int, total: int) -> bool:
+        if int(total) - int(prefix_len) < min_remaining:
+            return False
+        last_resume = float(getattr(state, "_lane_handover_last_resume_s", 0.0) or 0.0)
+        if last_resume and time.perf_counter() - last_resume < cooldown_s:
+            return False
+        try:
+            return bool(service.has_pending())
+        except Exception:  # noqa: BLE001
+            return False
+
+    return check
+
+
 def _submit_lane_continuation(
     state: Any,
     prompt_ids: list[int],
@@ -4232,13 +4277,24 @@ def _submit_lane_continuation(
     generated = [int(token) for token in out.tokens]
     final_state = getattr(out, "final_state", None)
     cache = getattr(final_state, "final_trunk_cache", None) if final_state is not None else None
-    if not generated or cache is None:
+    # Prefill-phase handover: no tokens yet, the cache covers prompt[:prefix_len]
+    # and the lane prefills prompt[prefix_len:] itself.
+    prefill_prefix_len: int | None = None
+    extra_state = getattr(final_state, "extra_state", None) if final_state is not None else None
+    if isinstance(extra_state, dict) and extra_state.get("prefill_handover_prefix_len") is not None:
+        prefill_prefix_len = int(extra_state["prefill_handover_prefix_len"])
+        if not (0 < prefill_prefix_len < len(prompt_ids)):
+            raise RuntimeError(
+                f"prefill handover prefix {prefill_prefix_len} outside the prompt ({len(prompt_ids)})"
+            )
+    if cache is None or (not generated and prefill_prefix_len is None):
         raise RuntimeError("handover without a cache or generated tokens")
     observability = dict(request_observability or {})
     observability["scheduler_lane"] = "solo_mtp->ar_batch"
     observability["lane_handover"] = {
         "solo_tokens": len(generated),
         "solo_elapsed_s": round(time.perf_counter() - started, 3),
+        "prefill_prefix_len": prefill_prefix_len,
     }
     job = _BatchedARJob(
         request_id=request_id or f"arbatch-{uuid.uuid4().hex}",
@@ -4263,12 +4319,20 @@ def _submit_lane_continuation(
         continuation=True,
     )
     job.insert_cache = cache
-    job.insert_all_tokens = [int(token) for token in prompt_ids] + generated[:-1]
-    job.insert_prompt_ids = [generated[-1]]
-    job.cached_tokens = len(job.insert_all_tokens)
-    job.session_cache_hit = True  # no prompt-boundary commit; the finished row banks the whole state
+    if prefill_prefix_len is not None:
+        job.insert_all_tokens = [int(token) for token in prompt_ids[:prefill_prefix_len]]
+        job.insert_prompt_ids = [int(token) for token in prompt_ids[prefill_prefix_len:]]
+        job.cached_tokens = prefill_prefix_len
+        # The row's first token commits the prompt boundary to the bank as usual.
+        job.session_cache_hit = False
+        job.effective_restore_mode = "lane_handover_prefill"
+    else:
+        job.insert_all_tokens = [int(token) for token in prompt_ids] + generated[:-1]
+        job.insert_prompt_ids = [generated[-1]]
+        job.cached_tokens = len(job.insert_all_tokens)
+        job.session_cache_hit = True  # no prompt-boundary commit; the finished row banks the whole state
+        job.effective_restore_mode = "lane_handover"
     job.cache_miss_reason = None
-    job.effective_restore_mode = "lane_handover"
     job.cache_source = "live"
     job.completion_token_counts = _Counter(generated)
     job.solo_prompt_ids = [int(token) for token in prompt_ids]
@@ -4276,7 +4340,9 @@ def _submit_lane_continuation(
     # Bank the solo state (with its MTP history) so the return trip can resume on the
     # solo lane from an exact prefix (prompt + g[:-1]) plus a suffix prefill of the
     # tokens the batch generates. The live cache goes to the batch, so bank a clone.
-    if session_bank is not None and _lane_handover_return_enabled():
+    # A prefill handover has no MTP history yet: no return trip (the row finishes
+    # in the lane; its prompt-boundary commit serves the next turn).
+    if prefill_prefix_len is None and session_bank is not None and _lane_handover_return_enabled():
         try:
             mtp_cache = getattr(final_state, "final_committed_mtp_cache", None)
             snapshot = snapshot_cache(cache)
@@ -4308,6 +4374,7 @@ def _submit_lane_continuation(
         session_id=session_id,
         prompt_tokens=len(prompt_ids),
         solo_tokens=len(generated),
+        prefill_prefix_len=prefill_prefix_len,
         remaining_max_tokens=job.max_tokens,
         return_to_solo=job.return_to_solo,
     )
@@ -26773,6 +26840,9 @@ def _run_generation(
                         constraint=constraint,
                         vision_splice=vision_splice,
                         handover_check=_make_handover_check(state, seed_is_explicit=seed_is_explicit),
+                        prefill_handover_check=_make_prefill_handover_check(
+                            state, seed_is_explicit=seed_is_explicit
+                        ),
                         abort_check=(
                             (
                                 lambda: bool(

@@ -270,3 +270,84 @@ def test_continuation_jumps_the_pending_queue():
     svc.submit(job("p3"))
     svc.submit(job("c2", continuation=True))
     assert [j.name for j in svc._pending] == ["c1", "c2", "p1", "p2", "p3"]
+
+
+# ---------------------------------------------------------------- prefill-phase handover
+def test_maybe_prefill_handover_raises_only_when_wanted():
+    from mtplx.generation import PrefillHandover, _maybe_prefill_handover
+    seen = []
+    _maybe_prefill_handover(None, "c", 2048, 100_000)  # no check: nothing
+    _maybe_prefill_handover(lambda p, t: seen.append((p, t)) or False, "c", 2048, 100_000)
+    assert seen == [(2048, 100_000)]
+    _maybe_prefill_handover(lambda p, t: True, "c", 0, 100)  # nothing in the cache yet
+    _maybe_prefill_handover(lambda p, t: True, "c", 100, 100)  # prefill complete
+    _maybe_prefill_handover(lambda p, t: 1 / 0, "c", 50, 100)  # a broken check never stops prefill
+    with pytest.raises(PrefillHandover) as info:
+        _maybe_prefill_handover(lambda p, t: True, ["cache"], 4096, 100_000)
+    assert info.value.cache == ["cache"] and info.value.prefix_len == 4096
+
+
+def test_prefill_handover_output_carries_the_prefix():
+    from mtplx.generation import PrefillHandover, _prefill_handover_output
+    out = _prefill_handover_output(SimpleNamespace(mtp_enabled=True), PrefillHandover(["c"], 6144), started_s=0.0, mtp_history_policy="committed")
+    assert out.finish_reason == "handover" and out.tokens == [] and out.text == ""
+    assert out.final_state.final_trunk_cache == ["c"]
+    assert out.final_state.extra_state == {"prefill_handover_prefix_len": 6144}
+    assert out.final_state.safe_to_commit is False and out.stats.generated_tokens == 0
+    assert out.stats.to_dict()["mode"] == "mtpk"
+
+
+def test_prefill_handover_check_gates(monkeypatch):
+    monkeypatch.setenv("MTPLX_LANE_HANDOVER", "1")
+    monkeypatch.setenv("MTPLX_LANE_HANDOVER_PREFILL_MIN_REMAINING_TOKENS", "4096")
+    monkeypatch.delenv("MTPLX_LANE_HANDOVER_PREFILL", raising=False)
+    st = _state(_Service(pending=True))
+    check = srv._make_prefill_handover_check(st, seed_is_explicit=False)
+    assert check is not None
+    assert check(2048, 100_000) is True, "pending lane + plenty left -> hand over"
+    assert check(98_000, 100_000) is False, "under the min remaining: finish solo"
+    st2 = _state(_Service(pending=False))
+    assert srv._make_prefill_handover_check(st2, seed_is_explicit=False)(2048, 100_000) is False
+    assert srv._make_prefill_handover_check(st, seed_is_explicit=True) is None
+    monkeypatch.setenv("MTPLX_LANE_HANDOVER_PREFILL", "0")
+    assert srv._make_prefill_handover_check(st, seed_is_explicit=False) is None
+    monkeypatch.setenv("MTPLX_LANE_HANDOVER_PREFILL", "1")
+    st.  _lane_handover_last_resume_s = __import__("time").perf_counter()
+    assert srv._make_prefill_handover_check(st, seed_is_explicit=False)(2048, 100_000) is False, "cooldown after a return"
+
+
+def test_submit_lane_continuation_prefill_handover(monkeypatch):
+    monkeypatch.setattr(srv, "_default_stop_tokens", lambda tok: {99})
+    service = _Service(); st = _state(service)
+    prompt = list(range(100, 200))
+    out = SimpleNamespace(
+        tokens=[], finish_reason="handover",
+        final_state=SimpleNamespace(final_trunk_cache=["partial"], extra_state={"prefill_handover_prefix_len": 40}),
+        stats=SimpleNamespace(to_dict=lambda: {"mode": "mtpk"}),
+    )
+    banked = []
+    bank = SimpleNamespace(put_snapshot=lambda **kw: banked.append(kw) or object())
+    marker = srv._submit_lane_continuation(
+        st, prompt, out, request_id="req-p", response_max=120, sampler=SamplerConfig(), generation_seed=1,
+        generation_limits={}, request_observability={"request_id": "req-p"}, token_callback=None,
+        prefill_callback=None, cancel_event=None, session_id="s", session_bank=bank, session_restore_mode="cold",
+        session_template_hash="t", session_draft_head_identity=None, session_policy_fingerprint="p",
+        token_times=[], started=0.0,
+    )
+    job = service.jobs[0]
+    assert job.continuation is True and job.insert_cache == ["partial"]
+    assert job.insert_all_tokens == prompt[:40] and job.insert_prompt_ids == prompt[40:]
+    assert job.cached_tokens == 40 and job.max_tokens == 120, "no solo tokens: the whole budget"
+    assert job.session_cache_hit is False, "the row's first token banks the prompt boundary"
+    assert job.effective_restore_mode == "lane_handover_prefill"
+    assert job.return_to_solo is False and banked == [], "no MTP history yet: no return trip, nothing cloned"
+    assert marker["_handover_solo_tokens"] == [] and marker["finish_reason"] == "handover"
+    assert job.request_observability["lane_handover"]["prefill_prefix_len"] == 40
+    with pytest.raises(RuntimeError):
+        bad = SimpleNamespace(tokens=[], finish_reason="handover",
+                              final_state=SimpleNamespace(final_trunk_cache=["c"], extra_state={"prefill_handover_prefix_len": 100}),
+                              stats=out.stats)
+        srv._submit_lane_continuation(st, prompt, bad, request_id="x", response_max=10, sampler=SamplerConfig(), generation_seed=1,
+            generation_limits={}, request_observability={}, token_callback=None, prefill_callback=None, cancel_event=None,
+            session_id=None, session_bank=None, session_restore_mode="cold", session_template_hash=None,
+            session_draft_head_identity=None, session_policy_fingerprint=None, token_times=[], started=0.0)
