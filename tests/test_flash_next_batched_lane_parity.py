@@ -90,7 +90,7 @@ def test_batched_ragged_prefill_and_decode_match_solo(layer_types, compiled, mon
     args = _args(layer_types)
     m = _model(args)
     m._gdn_compile_explicit_off = not compiled
-    m._gdn_compiled_lane = compiled
+    m._gdn_compiled_env = compiled  # upstream e29c166 dropped the per-lane flag; env is the only gate now
     mx.random.seed(3)
     ids = [mx.random.randint(0, 257, (1, n)) for n in LENS]
     dec = mx.random.randint(0, 257, (len(LENS), 1))
