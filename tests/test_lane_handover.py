@@ -249,3 +249,24 @@ def test_handover_check_hysteresis(monkeypatch):
     check2 = srv._make_handover_check(st2, seed_is_explicit=False)
     assert [check2() for _ in range(5)] == [False] * 5, "no handover within the cooldown after a return trip"
 
+
+
+def test_continuation_jumps_the_pending_queue():
+    """A handover continuation must be inserted ahead of waiting prompts:
+    mlx-lm's prompt batch holds prefill_batch_size (2) sequences, so a
+    continuation queued behind two cold prompts sat through their whole
+    prefill with no decode step (2026-09-24 live receipt: 7.5 s at 0 tok/s)."""
+    import mtplx.server.openai as srv
+
+    svc = srv._BatchedARGenerationService.__new__(srv._BatchedARGenerationService)
+    svc._condition = srv.Condition()
+    svc._pending = []
+    svc._pump_scheduled = True  # never schedule a real pump
+    def job(name, continuation=False):
+        j = SimpleNamespace(continuation=continuation, name=name, future=srv.Future())
+        return j
+    svc.submit(job("p1")); svc.submit(job("p2"))
+    svc.submit(job("c1", continuation=True))
+    svc.submit(job("p3"))
+    svc.submit(job("c2", continuation=True))
+    assert [j.name for j in svc._pending] == ["c1", "c2", "p1", "p2", "p3"]

@@ -4497,7 +4497,21 @@ class _BatchedARGenerationService:
 
     def submit(self, job: _BatchedARJob) -> Future:
         with self._condition:
-            self._pending.append(job)
+            if job.continuation:
+                # A handover continuation carries a live cache and ONE token:
+                # it leaves the prompt batch on the first step it is pulled
+                # in. mlx-lm pulls at most prefill_batch_size prompts at a
+                # time, so behind two cold prompts it would wait out their
+                # whole prefill with no decode step (live receipt 2026-09-24:
+                # 7.5 s at 0 tok/s for a 44-token-old stream). Front of the
+                # queue, ahead of every prompt.
+                first_prompt = next(
+                    (i for i, j in enumerate(self._pending) if not j.continuation),
+                    len(self._pending),
+                )
+                self._pending.insert(first_prompt, job)
+            else:
+                self._pending.append(job)
             if not self._pump_scheduled:
                 self._pump_scheduled = True
                 _submit_foreground_model_work(
@@ -5173,6 +5187,9 @@ class _BatchedARGenerationService:
         pending = [job for job in pending if not job.future.cancelled()]
         if not pending:
             return
+        # Continuations first in the insert order too: the generator pops
+        # prompts in insert order into its (small) prompt batch.
+        pending.sort(key=lambda j: 0 if j.continuation else 1)
         self._prepare_prompt_inputs(pending)
         pending, requeued = self._split_unmergeable_history_batch(pending)
         if requeued:
