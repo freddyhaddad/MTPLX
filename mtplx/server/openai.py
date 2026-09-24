@@ -4360,28 +4360,31 @@ class _BatchedARGenerationService:
 
     def _prepare_near_prefix_restore(self, job: _BatchedARJob) -> bool:
         """Exact-prefix entries are superseded by the finished entry (prompt +
-        generation), so a same-session follow-up turn is served by the
-        near-prefix BOUNDARY restore that the solo lane runs after an exact
-        miss; the batched lane never called it and re-prefilled the whole
-        prompt (2026-09-24 opencode receipt: ram_miss_reason
-        prefix_divergence_at_token with a 130-token candidate in the bank).
-        The restore consumes everything it is given, so hand it the prompt
-        minus its last token: the batch generator then inserts the restored
-        cache plus that one token and starts generating."""
+        generation), so a same-session follow-up turn is served by a near-prefix
+        BOUNDARY restore. This restores the bank entry up to the boundary and hands
+        the remaining tokens to the batch generator, which prefills them in chunks
+        interleaved with the other rows' decode steps. It must NOT prefill the
+        suffix here: this runs in the pump's admission step, and a 88k-token suffix
+        prefilled inline blocked every other stream for 190 s (2026-09-24 live).
+        Lookup on the prompt minus its last token so at least one token is left
+        to insert."""
         bank = getattr(job, "session_bank", None)
         if bank is None or len(job.prompt_ids) < 2 or job.cancel_requested():
             return False
         if any(int(token) >= (1 << 40) for token in job.prompt_ids):
             return False
+        candidates_fn = getattr(bank, "near_prefix_candidates", None)
+        restore_fn = getattr(bank, "restore_entry_prefix_cache", None)
+        if not callable(candidates_fn) or not callable(restore_fn):
+            return False
         head = [int(token) for token in job.prompt_ids[:-1]]
-        tail = [int(job.prompt_ids[-1])]
         started = time.perf_counter()
         try:
             from mtplx.generation import (
+                _entry_matches_restore_lookup,
+                _mtp_history_uses_committed_cache,
                 _resolve_mtp_history_policy,
                 _resolve_runtime_base_hidden_variant,
-                _resolve_runtime_mtp_hidden_variant,
-                _restore_near_prefix_prompt_state,
             )
 
             rt = self.state.runtime
@@ -4389,44 +4392,72 @@ class _BatchedARGenerationService:
                 requested_policy = _bank_history_policy(self.state)
             except Exception:  # noqa: BLE001
                 requested_policy = "committed"
-            prompt_state = _restore_near_prefix_prompt_state(
-                rt,
+            history_policy = _resolve_mtp_history_policy(requested_policy, len(head))
+            base_variant = _resolve_runtime_base_hidden_variant(rt, None)
+            draft_head = getattr(self.state, "draft_head_identity", None)
+            candidates = candidates_fn(
                 head,
-                base_hidden_variant=_resolve_runtime_base_hidden_variant(rt, None),
-                mtp_hidden_variant=_resolve_runtime_mtp_hidden_variant(rt, None),
-                mtp_history_policy=_resolve_mtp_history_policy(requested_policy, len(head)),
-                session_bank=bank,
+                model_path=str(rt.model_path),
+                mtp_enabled=bool(getattr(rt, "mtp_enabled", False)),
+                hidden_variant=base_variant,
                 template_hash=job.session_template_hash,
-                draft_head_identity=getattr(self.state, "draft_head_identity", None),
+                mtp_history_policy=history_policy,
+                draft_head_identity=draft_head,
                 policy_fingerprint=job.session_policy_fingerprint,
-                abort_check=job.cancel_requested,
-                chunk_started_s=started,  # the restore reads its `started` only when this is given
             )
+            chosen = None
+            for entry, matched in candidates:
+                matched = int(matched)
+                if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
+                    continue
+                if not _entry_matches_restore_lookup(
+                    entry, rt, hidden_variant=base_variant, template_hash=job.session_template_hash,
+                    mtp_history_policy=history_policy, draft_head_identity=draft_head,
+                    policy_fingerprint=job.session_policy_fingerprint,
+                ):
+                    continue
+                if _mtp_history_uses_committed_cache(history_policy) and not (
+                    entry.mtp_history_snapshot is not None or getattr(entry, "mtp_history_cache_ref", None) is not None
+                ):
+                    continue
+                modes = (["reference"] if getattr(entry, "live_ref_only", False)
+                         else ["reference", "clone"] if getattr(entry, "cache_ref", None) is not None else ["clone"])
+                for mode in modes:
+                    restored = restore_fn(rt, entry, matched, mode=mode)
+                    if restored is not None:
+                        chosen = (entry, matched, restored)
+                        break
+                if chosen is not None:
+                    break
         except Exception as exc:  # noqa: BLE001
             job.request_observability["ar_batch_near_prefix_error"] = f"{type(exc).__name__}: {exc}"
             _log_json_event("ar_batch_near_prefix_error", request_id=job.request_id, error=f"{type(exc).__name__}: {exc}")
             return False
-        if prompt_state is None or not getattr(prompt_state, "cache_hit", False):
+        if chosen is None:
             return False
-        cache = getattr(prompt_state, "trunk_cache", None)
-        if not cache or not self._cache_supports_batch_history_merge(cache):
+        entry, matched, restored = chosen
+        cache = restored[0]
+        restore_point = int(restored[3]) if len(restored) >= 4 else int(matched)
+        mode = str(restored[2]) if len(restored) >= 3 else "clone"
+        if not cache or restore_point < 1 or restore_point >= len(job.prompt_ids):
+            return False
+        if not self._cache_supports_batch_history_merge(cache):
             return False
         job.insert_cache = cache
-        job.insert_all_tokens = head
-        job.insert_prompt_ids = tail
-        job.cached_tokens = int(getattr(prompt_state, "cached_tokens", 0) or 0)
+        job.insert_all_tokens = [int(token) for token in job.prompt_ids[:restore_point]]
+        job.insert_prompt_ids = [int(token) for token in job.prompt_ids[restore_point:]]
+        job.cached_tokens = restore_point
         job.session_cache_hit = True
         job.cache_miss_reason = None
-        job.effective_restore_mode = f"ar_batch_near_prefix:{getattr(prompt_state, 'restore_mode', 'boundary')}"
-        job.cache_source = str(getattr(prompt_state, "cache_source", "ram") or "ram")
-        job.ssd_cache_hit = bool(getattr(prompt_state, "ssd_cache_hit", False))
-        job.ssd_cached_tokens = int(getattr(prompt_state, "ssd_cached_tokens", 0) or 0)
-        job.ssd_restore_s = float(getattr(prompt_state, "ssd_restore_s", 0.0) or 0.0)
-        job.ssd_suffix_tokens = int(getattr(prompt_state, "suffix_tokens", 0) or 0)
+        job.effective_restore_mode = f"ar_batch_near_prefix:{mode}"
+        job.cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+        job.ssd_cache_hit = job.cache_source == "ssd"
+        job.ssd_cached_tokens = restore_point if job.ssd_cache_hit else 0
+        job.ssd_suffix_tokens = len(job.insert_prompt_ids)
         job.prompt_prepare_s += time.perf_counter() - started
         job.request_observability["ar_batch_near_prefix_restore"] = {
-            "cached_tokens": job.cached_tokens,
-            "suffix_prefilled": job.ssd_suffix_tokens,
+            "cached_tokens": restore_point,
+            "suffix_to_generator": len(job.insert_prompt_ids),
             "restore_mode": job.effective_restore_mode,
             "prepare_s": round(time.perf_counter() - started, 3),
         }
@@ -4435,8 +4466,8 @@ class _BatchedARGenerationService:
             request_id=job.request_id,
             session_id=job.session_id,
             prompt_len=len(job.prompt_ids),
-            cached_tokens=job.cached_tokens,
-            suffix_prefilled=job.ssd_suffix_tokens,
+            cached_tokens=restore_point,
+            suffix_to_generator=len(job.insert_prompt_ids),
             restore_mode=job.effective_restore_mode,
             prepare_s=round(time.perf_counter() - started, 3),
         )
