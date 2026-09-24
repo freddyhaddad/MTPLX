@@ -267,19 +267,63 @@ def test_longer_live_ref_entry_is_not_leased(monkeypatch):
     assert job.cache_miss_reason == "ar_batch_full_prefix_not_insertable"
 
 
-def test_interleaved_generator_takes_extra_decode_steps_only_while_prefilling(monkeypatch):
-    class _GenBatch:
-        def __init__(self, n): self.n = n; self.calls = 0
-        def __len__(self): return self.n
-        def next(self): self.calls += 1; return [("tok", self.calls)]
+def _fake_interleaved_generator(srv, *, unprocessed, gen_rows=0, prefill_batch_size=2, completion_batch_size=4, step=2048):
+    """A stand-in for mlx-lm's BatchGenerator internals: prompt batch, generation
+    batch, unprocessed queue. Records every prompt() call's row lengths and every
+    decode step."""
+    from types import SimpleNamespace as NS
+    log = []
+    class _Gen:
+        def __init__(self): self.uids = list(range(gen_rows))
+        def __len__(self): return len(self.uids)
+        def next(self): log.append(("decode", list(self.uids))); return [NS(uid=u, token=1, finish_reason=None) for u in self.uids]
+        def extend(self, other): self.uids.extend(other.uids)
+    class _Prompt:
+        def __init__(self): self.uids = []
+        def __len__(self): return len(self.uids)
+        def extend(self, made): self.uids.extend(made.uids)
+        def split(self, idxs):
+            uids = [self.uids[i] for i in idxs]; self.uids = [u for i, u in enumerate(self.uids) if i not in idxs]
+            piece = NS(uids=uids); return NS(generate=lambda last_inputs: piece)
+        def prompt(self, prompts): log.append(("prompt", [len(p) for p in prompts]))
     class _Base:
-        def __init__(self): self._generation_batch = _GenBatch(2); self._currently_processing = ["p"]; self._unprocessed_sequences = []; self._gen_tokens_counter = 0; self._steps_counter = 0; self.base_calls = 0
-        def _next(self): self.base_calls += 1; return (["prompt"], [("tok", "base")])
-    cls = srv._interleaved_batch_generator_class(_Base)
+        def __init__(self):
+            self._generation_batch = _Gen(); self._prompt_batch = _Prompt()
+            self._unprocessed_sequences = list(unprocessed)  # (uid, [segment tokens])
+            self._currently_processing = []; self.prefill_batch_size = prefill_batch_size
+            self.completion_batch_size = completion_batch_size; self.prefill_step_size = step
+            self._gen_tokens_counter = 0; self._steps_counter = 0; self._prompt_tokens_counter = 0; self._prompt_time_counter = 0.0
+        def _make_batch(self, n):
+            uids = []
+            for _ in range(n):
+                uid, toks = self._unprocessed_sequences.pop(0); uids.append(uid)
+                toks = list(toks); self._currently_processing.append([[toks[:-1], toks[-1:]], 0, len(toks)])  # mlx-lm insert_segments: last token is its own segment
+            return NS(uids=uids)
+    g = srv._interleaved_batch_generator_class(_Base)()
+    return g, log
+
+
+def test_interleaved_generator_takes_extra_decode_steps_only_while_prefilling(monkeypatch):
     monkeypatch.setenv("MTPLX_AR_BATCH_DECODE_STEPS_PER_CHUNK", "4")
-    g = cls(); p, r = g._next()
-    assert p == ["prompt"] and r == [("tok", 1), ("tok", 2), ("tok", 3), ("tok", "base")] and g._steps_counter == 3
-    g2 = cls(); g2._currently_processing = []; g2._unprocessed_sequences = []
-    assert g2._next() == (["prompt"], [("tok", "base")]), "no prefill in progress: stock behaviour"
+    g, log = _fake_interleaved_generator(srv, unprocessed=[(7, list(range(5000)))], gen_rows=2)
+    g._next()
+    assert [e[0] for e in log].count("decode") == 4, "4 decode steps per chunk while a prompt prefills"
+    g2, log2 = _fake_interleaved_generator(srv, unprocessed=[], gen_rows=2)
+    g2._next()
+    assert [e[0] for e in log2] == ["decode"], "nothing prefilling: one step, stock behaviour"
+
+
+def test_interleaved_generator_admission_chunk_and_first_token(monkeypatch):
     monkeypatch.setenv("MTPLX_AR_BATCH_DECODE_STEPS_PER_CHUNK", "1")
-    g3 = cls(); assert g3._next() == (["prompt"], [("tok", "base")])
+    monkeypatch.setenv("MTPLX_AR_BATCH_ADMISSION_CHUNK_TOKENS", "256")
+    # A long continuation (5000 tokens left) and a 61-token newcomer enter together.
+    g, log = _fake_interleaved_generator(srv, unprocessed=[(1, list(range(5000))), (2, list(range(61)))])
+    p, r = g._next()
+    assert log == [("prompt", [256, 60])], "the admission step takes a SHORT chunk of the long row; the newcomer's whole body fits"
+    assert r == [] and g._currently_processing[1][0] == [[60]], "the newcomer keeps its last token for the split"
+    log.clear(); p, r = g._next()
+    # Step 2: the newcomer splits to generation and gets its first token BEFORE the long row's next (full) chunk.
+    assert [e[0] for e in log] == ["decode", "prompt"], "first token for the split row, then the chunk"
+    assert log[0] == ("decode", [2]) and log[1] == ("prompt", [2048])
+    assert [x.uid for x in r] == [2] and any(getattr(x, "end_of_prompt", False) and x.uid == 2 for x in p)
+    assert g._generation_batch.uids == [2] and g._prompt_batch.uids == [1]

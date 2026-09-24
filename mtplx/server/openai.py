@@ -4501,29 +4501,117 @@ def _ar_batch_decode_steps_per_chunk() -> int:
         return 1
 
 
+def _ar_batch_admission_chunk_tokens() -> int:
+    """Prefill chunk for the step in which new rows enter the prompt batch
+    (MTPLX_AR_BATCH_ADMISSION_CHUNK_TOKENS, default 256): a short prompt that
+    joins beside a long one otherwise waits a full 2048-token chunk of the long
+    row (ragged rows share one forward) before it can leave the prompt batch."""
+    try:
+        return max(1, int(os.environ.get("MTPLX_AR_BATCH_ADMISSION_CHUNK_TOKENS", "256")))
+    except ValueError:
+        return 256
+
+
 def _interleaved_batch_generator_class(base: type) -> type:
     """Subclass mlx-lm's BatchGenerator (passed in: this module must not import
-    mlx at import time) so each step takes extra decode steps for the active
-    rows before a prefill chunk (see _ar_batch_decode_steps_per_chunk)."""
+    mlx at import time). Same step as the library's ``_next`` (mlx-lm 0.31.x)
+    with three scheduling changes for a lane that mixes long prefills with live
+    streams:
+
+    1. while a prompt is prefilling, the active rows take
+       ``_ar_batch_decode_steps_per_chunk`` decode steps per prefill chunk
+       instead of one;
+    2. a prompt that just finished gets its first token in the same step,
+       before the next chunk of the other prompts (the library produced it
+       one chunk later);
+    3. the step that admits new rows uses a short chunk
+       (``_ar_batch_admission_chunk_tokens``) so a short newcomer clears the
+       prompt batch in ~0.3 s instead of one full chunk of its neighbour."""
 
     class _InterleavedBatchGenerator(base):
+        def _decode_steps(self, count: int) -> list:
+            import mlx.core as mx
+
+            out: list = []
+            gen_batch = self._generation_batch
+            for _ in range(max(0, int(count))):
+                if len(gen_batch) == 0:
+                    break
+                responses = gen_batch.next()
+                out.extend(responses)
+                self._gen_tokens_counter += len(responses)
+                self._steps_counter += 1
+                if self._steps_counter % 512 == 0:
+                    mx.clear_cache()
+            return out
+
         def _next(self):
-            extra = _ar_batch_decode_steps_per_chunk() - 1
-            gen_batch = getattr(self, "_generation_batch", None)
-            prefilling = bool(getattr(self, "_currently_processing", None)) or bool(
-                getattr(self, "_unprocessed_sequences", None)
+            from mlx_lm.generate import PromptProcessingBatch
+
+            generation_responses: list = []
+            prompt_responses: list = []
+            prefilling = bool(self._currently_processing) or bool(
+                self._unprocessed_sequences
             )
-            extra_responses = []
-            if extra > 0 and prefilling and gen_batch is not None and len(gen_batch) > 0:
-                for _ in range(extra):
-                    if len(gen_batch) == 0:
-                        break
-                    extra_responses.extend(gen_batch.next())
-                    self._gen_tokens_counter += 1
-                    self._steps_counter += 1
-            prompt_responses, generation_responses = super()._next()
-            if extra_responses:
-                generation_responses = [*extra_responses, *generation_responses]
+            generation_responses.extend(
+                self._decode_steps(_ar_batch_decode_steps_per_chunk() if prefilling else 1)
+            )
+            if len(self._generation_batch) >= self.completion_batch_size:
+                return prompt_responses, generation_responses
+
+            n = min(
+                self.prefill_batch_size - len(self._prompt_batch),
+                self.completion_batch_size - len(self._generation_batch),
+                len(self._unprocessed_sequences),
+            )
+            admitted = n > 0
+            if admitted:
+                self._prompt_batch.extend(self._make_batch(n))
+
+            keep = []
+            split = []
+            for i, seq in enumerate(self._currently_processing):
+                segments = seq[0]
+                if len(segments) == 1 and len(segments[0]) == 1:
+                    split.append(i)
+                else:
+                    keep.append(i)
+            if split:
+                last_inputs = [self._currently_processing[i][0][0] for i in split]
+                progress = [(self._currently_processing[i][2],) * 2 for i in split]
+                self._currently_processing = [self._currently_processing[i] for i in keep]
+                gen_batch = self._prompt_batch.split(split).generate(last_inputs)
+                for i, p in enumerate(progress):
+                    prompt_responses.append(
+                        PromptProcessingBatch.Response(gen_batch.uids[i], p, True, True)
+                    )
+                self._generation_batch.extend(gen_batch)
+                # (2) first token now, not after the next chunk.
+                generation_responses.extend(self._decode_steps(1))
+
+            step = int(self.prefill_step_size)
+            if admitted:
+                step = min(step, _ar_batch_admission_chunk_tokens())  # (3)
+            prompts = []
+            for i, seq in enumerate(self._currently_processing):
+                response = PromptProcessingBatch.Response(
+                    self._prompt_batch.uids[i], 0, False, False
+                )
+                segments = seq[0]
+                take = min(len(segments[0]), step)
+                prompts.append(segments[0][:take])
+                segments[0] = segments[0][take:]
+                if len(segments[0]) == 0:
+                    segments.pop(0)
+                    response.end_of_segment = True
+                seq[1] += len(prompts[-1])
+                response.progress = (seq[1], seq[2])
+                prompt_responses.append(response)
+            if prompts:
+                self._prompt_tokens_counter += sum(len(p) for p in prompts)
+                tic = time.perf_counter()
+                self._prompt_batch.prompt(prompts)
+                self._prompt_time_counter += time.perf_counter() - tic
             return prompt_responses, generation_responses
 
     return _InterleavedBatchGenerator
